@@ -1,5 +1,7 @@
 # HPC IO Benchmark Repository [![Build Status](https://travis-ci.org/hpc/ior.svg?branch=master)](https://travis-ci.org/hpc/ior)
 
+**Note:** This is a forked version from the original IOR repository, that contains experimental functionality for research-purposes only. See https://github.com/hpc/ior for the official source code.
+
 This repo now contains both IOR and mdtest.
 See also NOTES.txt
 
