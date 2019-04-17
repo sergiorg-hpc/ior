@@ -150,7 +150,7 @@ static mdtest_results_t * summary_table;
 static pid_t pid;
 static uid_t uid;
 
-/* just use the POSIX backend for now */
+/* Use the POSIX backend by default */
 static const char *backend_name = "POSIX";
 static const ior_aiori_t *backend;
 
@@ -210,8 +210,10 @@ void parse_dirpath(char *dirpath_arg) {
         }
         tmp++;
     }
+    // prevent changes to the original dirpath_arg
+    dirpath_arg = strdup(dirpath_arg);
     filenames = (char **)malloc(path_count * sizeof(char **));
-    if (filenames == NULL) {
+    if (filenames == NULL || dirpath_arg == NULL) {
         FAIL("out of memory");
     }
 
@@ -1321,7 +1323,7 @@ void print_help (void) {
 
     char APIs[1024];
     char APIs_legacy[1024];
-    aiori_supported_apis(APIs, APIs_legacy);
+    aiori_supported_apis(APIs, APIs_legacy, MDTEST);
     char apiStr[1024];
     sprintf(apiStr, "API for I/O [%s]", APIs);
 
@@ -1569,10 +1571,6 @@ void valid_tests() {
     }
     if (collective_creates && !barriers) {
         FAIL("-c not compatible with -B");
-    }
-
-    if (strcasecmp(backend_name, "POSIX") != 0 && strcasecmp(backend_name, "DUMMY") != 0) {
-      FAIL("-a only supported interface is POSIX (and DUMMY) right now!");
     }
 
     /* check for shared file incompatibilities */
@@ -2129,7 +2127,7 @@ mdtest_results_t * mdtest_run(int argc, char **argv, MPI_Comm world_com, FILE * 
     int randomize = 0;
     char APIs[1024];
     char APIs_legacy[1024];
-    aiori_supported_apis(APIs, APIs_legacy);
+    aiori_supported_apis(APIs, APIs_legacy, MDTEST);
     char apiStr[1024];
     sprintf(apiStr, "API for I/O [%s]", APIs);
 

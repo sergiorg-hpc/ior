@@ -467,7 +467,7 @@ IOR_test_t *ParseCommandLine(int argc, char **argv)
 
     char APIs[1024];
     char APIs_legacy[1024];
-    aiori_supported_apis(APIs, APIs_legacy);
+    aiori_supported_apis(APIs, APIs_legacy, IOR);
     char apiStr[1024];
     sprintf(apiStr, "API for I/O [%s]", APIs);
 
@@ -563,7 +563,7 @@ IOR_test_t *ParseCommandLine(int argc, char **argv)
           }
         }
         if (memoryPerNode){
-          initialTestParams.memoryPerNode = NodeMemoryStringToBytes(optarg);
+          initialTestParams.memoryPerNode = NodeMemoryStringToBytes(memoryPerNode);
         }
         const ior_aiori_t * backend = aiori_select(initialTestParams.api);
         if (backend == NULL)
