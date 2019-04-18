@@ -5,9 +5,9 @@ BUILDDIR="$IORDIR/build"
 BINDIR=$IORDIR/../build/bin
 UMMAPIO=$IORDIR/../ummap-io/build
 
-export MPICC=mpicc
-export CC=gcc
-export CFLAGS="-I/usr/include/mpi -I$UMMAPIO/include"
+export CC=$1
+export MPICC=$1
+export CFLAGS="-I$UMMAPIO/include"
 export LDFLAGS="-L$UMMAPIO/lib"
 export LIBS="-lummapio"
 
