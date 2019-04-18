@@ -19,5 +19,5 @@ then
     ./configure --with-mmap --prefix=$BUILDDIR
 fi
 
-make && cp $IORDIR/src/ior $BINDIR/ior.out
+make CC="$CC" MPICC="$MPICC" && cp $IORDIR/src/ior $BINDIR/ior.out
 
