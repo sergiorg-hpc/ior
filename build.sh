@@ -5,6 +5,7 @@ BUILDDIR="$IORDIR/build"
 BINDIR=$IORDIR/../build/bin
 UMMAPIO=$IORDIR/../ummap-io/build
 MAKEFILE_CHECK=`ls $IORDIR/src/Makefile 2>/dev/null`
+CRAY_CHECK=`cc -V 2>&1 | grep Cray`
 
 if [[ $1 == "make" ]]
 then
@@ -13,6 +14,11 @@ then
     export CFLAGS="-I$UMMAPIO/include"
     export LDFLAGS="-L$UMMAPIO/lib"
     export LIBS="-lummapio"
+
+    if [[ $CRAY_CHECK == "" ]]
+    then
+        export LIBS="$LIBS -pthread -lrt"
+    fi
 
     cd $IORDIR
 
@@ -25,6 +31,8 @@ then
     make CC="$CC" MPICC="$MPICC" && cp $IORDIR/src/ior $BINDIR/ior.out
 else
     cd $IORDIR
+
+    rm $BINDIR/ior.out 2>/dev/null
 
     if [[ $MAKEFILE_CHECK != "" ]]
     then

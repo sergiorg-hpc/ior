@@ -24,6 +24,7 @@
 #include "aiori.h"
 #include "iordef.h"
 #include "utilities.h"
+#include "ummap.h"
 
 /**************************** P R O T O T Y P E S *****************************/
 static void *uMMAP_Create(char *, IOR_param_t *);
@@ -49,30 +50,19 @@ ior_aiori_t ummap_aiori = {
 
 /***************************** F U N C T I O N S ******************************/
 
-static void ior_ummap_file(int *file, IOR_param_t *param)
+static void ior_ummap_file(int *fd, IOR_param_t *param)
 {
-        printf("uMMAP-IO atopeeeeeeeeeeeeeeeeeee!!\n");
-        
+        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+
         int flags = PROT_READ;
         IOR_offset_t size = param->expectedAggFileSize;
 
         if (param->open == WRITE)
                 flags |= PROT_WRITE;
 
-        param->mmap_ptr = mmap(NULL, size, flags, MAP_SHARED,
-                               *file, 0);
-        if (param->mmap_ptr == MAP_FAILED)
-                ERR("mmap() failed");
-
-        if (param->randomOffset)
-                flags = POSIX_MADV_RANDOM;
-        else
-                flags = POSIX_MADV_SEQUENTIAL;
-        if (posix_madvise(param->mmap_ptr, size, flags) != 0)
-                ERR("madvise() failed");
-
-        if (posix_madvise(param->mmap_ptr, size, POSIX_MADV_DONTNEED) != 0)
-                ERR("madvise() failed");
+        if (ummap(size, param->blockSize, flags, *fd, 0, UINT_MAX, TRUE, 0, 
+                  &param->mmap_ptr) != 0)
+                ERR("ummap() failed");
 
         return;
 }
@@ -82,6 +72,8 @@ static void ior_ummap_file(int *file, IOR_param_t *param)
  */
 static void *uMMAP_Create(char *testFileName, IOR_param_t * param)
 {
+        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+        
         int *fd;
 
         fd = POSIX_Create(testFileName, param);
@@ -96,6 +88,8 @@ static void *uMMAP_Create(char *testFileName, IOR_param_t * param)
  */
 static void *uMMAP_Open(char *testFileName, IOR_param_t * param)
 {
+        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+        
         int *fd;
 
         fd = POSIX_Open(testFileName, param);
@@ -109,6 +103,8 @@ static void *uMMAP_Open(char *testFileName, IOR_param_t * param)
 static IOR_offset_t uMMAP_Xfer(int access, void *file, IOR_size_t * buffer,
                                IOR_offset_t length, IOR_param_t * param)
 {
+        // printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+        
         if (access == WRITE) {
                 memcpy(param->mmap_ptr + param->offset, buffer, length);
         } else {
@@ -116,11 +112,8 @@ static IOR_offset_t uMMAP_Xfer(int access, void *file, IOR_size_t * buffer,
         }
 
         if (param->fsyncPerWrite == TRUE) {
-                if (msync(param->mmap_ptr + param->offset, length, MS_SYNC) != 0)
-                        ERR("msync() failed");
-                if (posix_madvise(param->mmap_ptr + param->offset, length,
-                                  POSIX_MADV_DONTNEED) != 0)
-                        ERR("madvise() failed");
+                if (umsync(param->mmap_ptr, TRUE) != 0)
+                        ERR("umsync() failed");
         }
         return (length);
 }
@@ -130,8 +123,10 @@ static IOR_offset_t uMMAP_Xfer(int access, void *file, IOR_size_t * buffer,
  */
 static void uMMAP_Fsync(void *fd, IOR_param_t * param)
 {
-        if (msync(param->mmap_ptr, param->expectedAggFileSize, MS_SYNC) != 0)
-                EWARN("msync() failed");
+        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+        
+        if (umsync(param->mmap_ptr, FALSE) != 0)
+                EWARN("umsync() failed");
 }
 
 /*
@@ -139,8 +134,10 @@ static void uMMAP_Fsync(void *fd, IOR_param_t * param)
  */
 static void uMMAP_Close(void *fd, IOR_param_t * param)
 {
-        if (munmap(param->mmap_ptr, param->expectedAggFileSize) != 0)
-                ERR("munmap failed");
+        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+        
+        if (umunmap(param->mmap_ptr, FALSE) != 0)
+                ERR("umunmap failed");
         param->mmap_ptr = NULL;
         POSIX_Close(fd, param);
 }
