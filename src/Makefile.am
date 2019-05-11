@@ -61,6 +61,10 @@ if USE_MMAP_AIORI
 extraSOURCES += aiori-MMAP.c
 endif
 
+if USE_uMMAP_AIORI
+extraSOURCES += aiori-uMMAP.c
+endif
+
 if USE_POSIX_AIORI
 extraSOURCES += aiori-POSIX.c
 endif

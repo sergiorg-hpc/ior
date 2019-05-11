@@ -163,6 +163,17 @@ AM_COND_IF([USE_MMAP_AIORI],[
         AC_DEFINE([USE_MMAP_AIORI], [], [Build MMAP backend AIORI])
 ])
 
+# uMMAP IO support
+AC_ARG_WITH([ummap],
+        [AS_HELP_STRING([--with-ummap],
+           [support IO with uMMAP backend @<:@default=yes@:>@])],
+        [],
+        [with_ummap=yes])
+AM_CONDITIONAL([USE_uMMAP_AIORI], [test x$with_ummap = xyes])
+AM_COND_IF([USE_uMMAP_AIORI],[
+        AC_DEFINE([USE_uMMAP_AIORI], [], [Build uMMAP backend AIORI])
+])
+
 # POSIX IO support
 AC_ARG_WITH([posix],
         [AS_HELP_STRING([--with-posix],

@@ -19,7 +19,7 @@ then
     if [[ $MAKEFILE_CHECK == "" ]]
     then
         ./bootstrap
-        ./configure --with-mmap --without-gpfs --prefix=$BUILDDIR
+        ./configure --with-mmap --with-ummap --without-gpfs --prefix=$BUILDDIR
     fi
 
     make CC="$CC" MPICC="$MPICC" && cp $IORDIR/src/ior $BINDIR/ior.out

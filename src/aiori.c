@@ -61,6 +61,9 @@ ior_aiori_t *available_aiori[] = {
 #ifdef USE_MMAP_AIORI
         &mmap_aiori,
 #endif
+#ifdef USE_uMMAP_AIORI
+        &ummap_aiori,
+#endif
 #ifdef USE_S3_AIORI
         &s3_aiori,
         &s3_plus_aiori,

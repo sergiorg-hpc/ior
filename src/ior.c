@@ -1594,6 +1594,7 @@ static void ValidateTests(IOR_param_t * test)
         if (((strcasecmp(test->api, "POSIX") != 0)
             && (strcasecmp(test->api, "MPIIO") != 0)
             && (strcasecmp(test->api, "MMAP") != 0)
+            && (strcasecmp(test->api, "uMMAP") != 0)
             && (strcasecmp(test->api, "HDFS") != 0)
             && (strcasecmp(test->api, "RADOS") != 0)) && test->fsync)
                 WARN_RESET("fsync() not supported in selected backend",
@@ -1630,6 +1631,9 @@ static void ValidateTests(IOR_param_t * test)
         if ((strcasecmp(test->api, "MMAP") == 0) && test->fsyncPerWrite
             && (test->transferSize & (sysconf(_SC_PAGESIZE) - 1)))
                 ERR("transfer size must be aligned with PAGESIZE for MMAP with fsyncPerWrite");
+        // if ((strcasecmp(test->api, "uMMAP") == 0) && test->fsyncPerWrite
+        //     && (test->transferSize & (sysconf(_SC_PAGESIZE) - 1)))
+        //         ERR("transfer size must be aligned with PAGESIZE for uMMAP with fsyncPerWrite");
 
         /* parameter consitency */
         if (test->reorderTasks == TRUE && test->reorderTasksRandom == TRUE)
