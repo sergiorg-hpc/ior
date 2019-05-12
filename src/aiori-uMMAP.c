@@ -36,6 +36,8 @@ static void uMMAP_Fsync(void *, IOR_param_t *);
 
 /************************** D E C L A R A T I O N S ***************************/
 
+static off_t file_offset = UINT64_MAX;
+
 ior_aiori_t ummap_aiori = {
         .name = "uMMAP",
         .create = uMMAP_Create,
@@ -59,6 +61,8 @@ static void ior_ummap_file(int *fd, IOR_param_t *param)
         if (ummap(size, seg_size, prot, *fd, 0, UINT_MAX, (param->open == READ),
                   0, &param->mmap_ptr) != 0)
                 ERR("ummap() failed");
+
+        file_offset = UINT64_MAX;
 
         return;
 }
@@ -95,16 +99,25 @@ static void *uMMAP_Open(char *testFileName, IOR_param_t * param)
 static IOR_offset_t uMMAP_Xfer(int access, void *file, IOR_size_t * buffer,
                                IOR_offset_t length, IOR_param_t * param)
 {
+        if (file_offset == UINT64_MAX)
+        {
+                size_t size = param->expectedAggFileSize / param->numTasks;
+                file_offset = (param->offset / param->blockSize) * size;
+        }
+        
         if (access == WRITE) {
-                memcpy(param->mmap_ptr + param->offset, buffer, length);
+                memcpy(param->mmap_ptr + file_offset, buffer, length);
         } else {
-                memcpy(buffer, param->mmap_ptr + param->offset, length);
+                memcpy(buffer, param->mmap_ptr + file_offset, length);
         }
 
         if (param->fsyncPerWrite == TRUE) {
                 if (umsync(param->mmap_ptr, TRUE) != 0)
                         ERR("umsync() failed");
         }
+        
+        file_offset += param->blockSize;
+        
         return (length);
 }
 
