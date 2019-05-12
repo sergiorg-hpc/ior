@@ -56,8 +56,8 @@ static void ior_ummap_file(int *fd, IOR_param_t *param)
         const size_t seg_size = param->blockSize;
         const int    prot     = PROT_READ | (param->open == WRITE) * PROT_WRITE;
 
-        if (ummap(size, seg_size, prot, *fd, 0, UINT_MAX, TRUE, 0, 
-                  &param->mmap_ptr) != 0)
+        if (ummap(size, seg_size, prot, *fd, 0, UINT_MAX, (param->open == READ),
+                  0, &param->mmap_ptr) != 0)
                 ERR("ummap() failed");
 
         return;
