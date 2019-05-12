@@ -6,6 +6,9 @@
 * Implement of abstract I/O interface for MMAP.
 *
 \******************************************************************************/
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
@@ -35,6 +38,10 @@ static void MMAP_Fsync(void *, IOR_param_t *);
 
 /************************** D E C L A R A T I O N S ***************************/
 
+#define MMAP_FLAGS (MAP_PRIVATE | MAP_NORESERVE | MAP_ANONYMOUS)
+
+static int mem_alloc = -1;
+
 ior_aiori_t mmap_aiori = {
         .name = "MMAP",
         .create = MMAP_Create,
@@ -49,16 +56,26 @@ ior_aiori_t mmap_aiori = {
 
 /***************************** F U N C T I O N S ******************************/
 
+static void update_settings()
+{
+        if (mem_alloc < 0)
+        {
+                const char *buffer = getenv("IOR_MMAP_MEMALLOC");
+                mem_alloc = (buffer != NULL && !strcmp(buffer, "true"));
+        }
+}
+
 static void ior_mmap_file(int *file, IOR_param_t *param)
 {
-        int flags = PROT_READ;
+        int fd    = (mem_alloc) ? -1 : *file;
+        int prot  = PROT_READ;
+        int flags = (mem_alloc) ? MMAP_FLAGS : MAP_SHARED;
         IOR_offset_t size = param->expectedAggFileSize;
 
         if (param->open == WRITE)
-                flags |= PROT_WRITE;
+                prot |= PROT_WRITE;
 
-        param->mmap_ptr = mmap(NULL, size, flags, MAP_SHARED,
-                               *file, 0);
+        param->mmap_ptr = mmap(NULL, size, prot, flags, fd, 0);
         if (param->mmap_ptr == MAP_FAILED)
                 ERR("mmap() failed");
 
@@ -76,11 +93,13 @@ static void ior_mmap_file(int *file, IOR_param_t *param)
 }
 
 /*
- * Creat and open a file through the POSIX interface, then setup mmap.
+ * Create and open a file through the POSIX interface, then setup mmap.
  */
 static void *MMAP_Create(char *testFileName, IOR_param_t * param)
 {
         int *fd;
+
+        update_settings();
 
         fd = POSIX_Create(testFileName, param);
         if (ftruncate(*fd, param->expectedAggFileSize) != 0)
@@ -95,6 +114,8 @@ static void *MMAP_Create(char *testFileName, IOR_param_t * param)
 static void *MMAP_Open(char *testFileName, IOR_param_t * param)
 {
         int *fd;
+
+        update_settings();
 
         fd = POSIX_Open(testFileName, param);
         ior_mmap_file(fd, param);

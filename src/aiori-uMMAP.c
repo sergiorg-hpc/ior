@@ -52,15 +52,11 @@ ior_aiori_t ummap_aiori = {
 
 static void ior_ummap_file(int *fd, IOR_param_t *param)
 {
-        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
+        const size_t size     = param->expectedAggFileSize;
+        const size_t seg_size = param->blockSize;
+        const int    prot     = PROT_READ | (param->open == WRITE) * PROT_WRITE;
 
-        int flags = PROT_READ;
-        IOR_offset_t size = param->expectedAggFileSize;
-
-        if (param->open == WRITE)
-                flags |= PROT_WRITE;
-
-        if (ummap(size, param->blockSize, flags, *fd, 0, UINT_MAX, TRUE, 0, 
+        if (ummap(size, seg_size, prot, *fd, 0, UINT_MAX, TRUE, 0, 
                   &param->mmap_ptr) != 0)
                 ERR("ummap() failed");
 
@@ -68,12 +64,10 @@ static void ior_ummap_file(int *fd, IOR_param_t *param)
 }
 
 /*
- * Creat and open a file through the POSIX interface, then setup ummap.
+ * Create and open a file through the POSIX interface, then setup ummap.
  */
 static void *uMMAP_Create(char *testFileName, IOR_param_t * param)
 {
-        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
-        
         int *fd;
 
         fd = POSIX_Create(testFileName, param);
@@ -88,8 +82,6 @@ static void *uMMAP_Create(char *testFileName, IOR_param_t * param)
  */
 static void *uMMAP_Open(char *testFileName, IOR_param_t * param)
 {
-        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
-        
         int *fd;
 
         fd = POSIX_Open(testFileName, param);
@@ -103,8 +95,6 @@ static void *uMMAP_Open(char *testFileName, IOR_param_t * param)
 static IOR_offset_t uMMAP_Xfer(int access, void *file, IOR_size_t * buffer,
                                IOR_offset_t length, IOR_param_t * param)
 {
-        // printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
-        
         if (access == WRITE) {
                 memcpy(param->mmap_ptr + param->offset, buffer, length);
         } else {
@@ -123,8 +113,6 @@ static IOR_offset_t uMMAP_Xfer(int access, void *file, IOR_size_t * buffer,
  */
 static void uMMAP_Fsync(void *fd, IOR_param_t * param)
 {
-        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
-        
         if (umsync(param->mmap_ptr, FALSE) != 0)
                 EWARN("umsync() failed");
 }
@@ -134,8 +122,6 @@ static void uMMAP_Fsync(void *fd, IOR_param_t * param)
  */
 static void uMMAP_Close(void *fd, IOR_param_t * param)
 {
-        printf("%s:%d -> %s / atopeeeeeeee!!\n", __FILE__, __LINE__, __func__);
-        
         if (umunmap(param->mmap_ptr, FALSE) != 0)
                 ERR("umunmap failed");
         param->mmap_ptr = NULL;
