@@ -131,7 +131,11 @@ static void *MMAP_Open(char *testFileName, IOR_param_t * param)
 static IOR_offset_t MMAP_Xfer(int access, void *file, IOR_size_t * buffer,
                                IOR_offset_t length, IOR_param_t * param)
 {
-        if (file_offset == UINT64_MAX)
+        if (param->randomOffset)
+        {
+                file_offset = param->offset;
+        }
+        else if (file_offset == UINT64_MAX)
         {
                 size_t size = param->expectedAggFileSize / param->numTasks;
                 file_offset = (param->offset / param->blockSize) * size;
