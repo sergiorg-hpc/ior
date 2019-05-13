@@ -40,7 +40,8 @@ static void MMAP_Fsync(void *, IOR_param_t *);
 
 #define MMAP_FLAGS (MAP_PRIVATE | MAP_NORESERVE | MAP_ANONYMOUS)
 
-static int mem_alloc = -1;
+static int   mem_alloc   = -1;
+static off_t file_offset = UINT64_MAX;
 
 ior_aiori_t mmap_aiori = {
         .name = "MMAP",
@@ -89,6 +90,8 @@ static void ior_mmap_file(int *file, IOR_param_t *param)
         if (posix_madvise(param->mmap_ptr, size, POSIX_MADV_DONTNEED) != 0)
                 ERR("madvise() failed");
 
+        file_offset = UINT64_MAX;
+
         return;
 }
 
@@ -128,19 +131,28 @@ static void *MMAP_Open(char *testFileName, IOR_param_t * param)
 static IOR_offset_t MMAP_Xfer(int access, void *file, IOR_size_t * buffer,
                                IOR_offset_t length, IOR_param_t * param)
 {
+        if (file_offset == UINT64_MAX)
+        {
+                size_t size = param->expectedAggFileSize / param->numTasks;
+                file_offset = (param->offset / param->blockSize) * size;
+        }
+        
         if (access == WRITE) {
-                memcpy(param->mmap_ptr + param->offset, buffer, length);
+                memcpy(param->mmap_ptr + file_offset, buffer, length);
         } else {
-                memcpy(buffer, param->mmap_ptr + param->offset, length);
+                memcpy(buffer, param->mmap_ptr + file_offset, length);
         }
 
         if (param->fsyncPerWrite == TRUE) {
-                if (msync(param->mmap_ptr + param->offset, length, MS_SYNC) != 0)
+                if (msync(param->mmap_ptr + file_offset, length, MS_SYNC) != 0)
                         ERR("msync() failed");
-                if (posix_madvise(param->mmap_ptr + param->offset, length,
+                if (posix_madvise(param->mmap_ptr + file_offset, length,
                                   POSIX_MADV_DONTNEED) != 0)
                         ERR("madvise() failed");
         }
+        
+        file_offset += param->blockSize;
+        
         return (length);
 }
 
