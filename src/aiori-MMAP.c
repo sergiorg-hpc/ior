@@ -40,8 +40,12 @@ static void MMAP_Fsync(void *, IOR_param_t *);
 
 #define MMAP_FLAGS (MAP_PRIVATE | MAP_NORESERVE | MAP_ANONYMOUS)
 
-static int   mem_alloc   = -1;
-static off_t file_offset = UINT64_MAX;
+static struct
+{
+        int    mem_alloc;
+        size_t size_rank;
+        off_t  file_offset;
+} aiori_cfg = { 0 };
 
 ior_aiori_t mmap_aiori = {
         .name = "MMAP",
@@ -57,20 +61,23 @@ ior_aiori_t mmap_aiori = {
 
 /***************************** F U N C T I O N S ******************************/
 
-static void update_settings()
+static void update_settings(IOR_param_t *param)
 {
-        if (mem_alloc < 0)
-        {
-                const char *buffer = getenv("IOR_MMAP_MEMALLOC");
-                mem_alloc = (buffer != NULL && !strcmp(buffer, "true"));
-        }
+        const char *buffer = getenv("IOR_MMAP_MEMALLOC");
+        int        rank    = INT_MAX;
+        
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        
+        aiori_cfg.mem_alloc   = (buffer != NULL && !strcmp(buffer, "true"));
+        aiori_cfg.size_rank   = param->expectedAggFileSize / param->numTasks;
+        aiori_cfg.file_offset = (off_t)rank * aiori_cfg.size_rank;
 }
 
 static void ior_mmap_file(int *file, IOR_param_t *param)
 {
-        int fd    = (mem_alloc) ? -1 : *file;
+        int fd    = (aiori_cfg.mem_alloc) ? -1 : *file;
         int prot  = PROT_READ;
-        int flags = (mem_alloc) ? MMAP_FLAGS : MAP_SHARED;
+        int flags = (aiori_cfg.mem_alloc) ? MMAP_FLAGS : MAP_SHARED;
         IOR_offset_t size = param->expectedAggFileSize;
 
         if (param->open == WRITE)
@@ -90,8 +97,6 @@ static void ior_mmap_file(int *file, IOR_param_t *param)
         if (posix_madvise(param->mmap_ptr, size, POSIX_MADV_DONTNEED) != 0)
                 ERR("madvise() failed");
 
-        file_offset = UINT64_MAX;
-
         return;
 }
 
@@ -102,7 +107,7 @@ static void *MMAP_Create(char *testFileName, IOR_param_t * param)
 {
         int *fd;
 
-        update_settings();
+        update_settings(param);
 
         fd = POSIX_Create(testFileName, param);
         if (ftruncate(*fd, param->expectedAggFileSize) != 0)
@@ -118,7 +123,7 @@ static void *MMAP_Open(char *testFileName, IOR_param_t * param)
 {
         int *fd;
 
-        update_settings();
+        update_settings(param);
 
         fd = POSIX_Open(testFileName, param);
         ior_mmap_file(fd, param);
@@ -131,31 +136,31 @@ static void *MMAP_Open(char *testFileName, IOR_param_t * param)
 static IOR_offset_t MMAP_Xfer(int access, void *file, IOR_size_t * buffer,
                                IOR_offset_t length, IOR_param_t * param)
 {
+        off_t offset = aiori_cfg.file_offset;
+        
         if (param->randomOffset)
         {
-                file_offset = param->offset;
-        }
-        else if (file_offset == UINT64_MAX)
-        {
-                size_t size = param->expectedAggFileSize / param->numTasks;
-                file_offset = (param->offset / param->blockSize) * size;
+                offset += (param->offset % aiori_cfg.size_rank);
         }
         
         if (access == WRITE) {
-                memcpy(param->mmap_ptr + file_offset, buffer, length);
+                memcpy(param->mmap_ptr + offset, buffer, length);
         } else {
-                memcpy(buffer, param->mmap_ptr + file_offset, length);
+                memcpy(buffer, param->mmap_ptr + offset, length);
         }
 
         if (param->fsyncPerWrite == TRUE) {
-                if (msync(param->mmap_ptr + file_offset, length, MS_SYNC) != 0)
+                if (msync(param->mmap_ptr + offset, length, MS_SYNC) != 0)
                         ERR("msync() failed");
-                if (posix_madvise(param->mmap_ptr + file_offset, length,
+                if (posix_madvise(param->mmap_ptr + offset, length,
                                   POSIX_MADV_DONTNEED) != 0)
                         ERR("madvise() failed");
         }
         
-        file_offset += param->blockSize;
+        if (!param->randomOffset)
+        {
+                aiori_cfg.file_offset += param->blockSize;
+        }
         
         return (length);
 }
