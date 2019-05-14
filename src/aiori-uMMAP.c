@@ -38,6 +38,7 @@ static void uMMAP_Fsync(void *, IOR_param_t *);
 
 static struct
 {
+        int    read;
         size_t size_rank;
         off_t  file_offset;
 } aiori_cfg = { 0 };
@@ -58,10 +59,12 @@ ior_aiori_t ummap_aiori = {
 
 static void update_settings(IOR_param_t *param)
 {
-        int rank = INT_MAX;
+        const char *buffer = getenv("IOR_uMMAP_READ");
+        int        rank    = INT_MAX;
         
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
         
+        aiori_cfg.read        = (buffer != NULL && !strcmp(buffer, "true"));
         aiori_cfg.size_rank   = param->expectedAggFileSize / param->numTasks;
         aiori_cfg.file_offset = (off_t)rank * aiori_cfg.size_rank;
 }
@@ -71,9 +74,10 @@ static void ior_ummap_file(int *fd, IOR_param_t *param)
         const size_t size     = param->expectedAggFileSize;
         const size_t seg_size = param->blockSize;
         const int    prot     = PROT_READ | (param->open == WRITE) * PROT_WRITE;
-
-        if (ummap(size, seg_size, prot, *fd, 0, UINT_MAX, (param->open == READ),
-                  0, &param->mmap_ptr) != 0)
+        const int    read     = (aiori_cfg.read || param->open == READ);
+        
+        if (ummap(size, seg_size, prot, *fd, 0, UINT_MAX, read, 0,
+                  &param->mmap_ptr) != 0)
                 ERR("ummap() failed");
 
         return;
