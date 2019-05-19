@@ -40,6 +40,7 @@
 #include "aiori.h"
 #include "utilities.h"
 #include "parse_options.h"
+#include "ummap.h"
 
 #define IOR_NB_TIMERS 6
 
@@ -111,6 +112,7 @@ int ior_main(int argc, char **argv)
 
     /* start the MPI code */
     MPI_CHECK(MPI_Init(&argc, &argv), "cannot initialize MPI");
+    ummap_init();
 
     mpi_comm_world = MPI_COMM_WORLD;
     MPI_CHECK(MPI_Comm_size(mpi_comm_world, &numTasksWorld),
@@ -155,6 +157,7 @@ int ior_main(int argc, char **argv)
     /* display finish time */
     PrintTestEnds();
 
+    ummap_finalize();
     MPI_CHECK(MPI_Finalize(), "cannot finalize MPI");
 
     aiori_finalize(tests_head);
