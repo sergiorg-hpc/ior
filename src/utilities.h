@@ -18,14 +18,10 @@
 #include <mpi.h>
 #include "ior.h"
 
-extern int numTasksWorld;
 extern int rank;
 extern int rankOffset;
-extern int tasksPerNode;
 extern int verbose;
 extern MPI_Comm testComm;
-extern MPI_Comm mpi_comm_world;
-extern FILE * out_logfile;
 extern FILE * out_resultfile;
 extern enum OutputFormat_t outputFormat;  /* format of the output */
 
@@ -33,47 +29,41 @@ extern enum OutputFormat_t outputFormat;  /* format of the output */
  * Try using the system's PATH_MAX, which is what realpath and such use.
  */
 #define MAX_PATHLEN PATH_MAX
+#define ERROR_LOCATION __func__
 
 
-#ifdef __linux__
-#define FAIL(msg) do {                                                   \
-        fprintf(out_logfile, "%s: Process %d: FAILED in %s, %s: %s\n",   \
-                PrintTimestamp(), rank, __func__,                       \
-                msg, strerror(errno));                                   \
-        fflush(out_logfile);                                             \
-        MPI_Abort(testComm, 1);                                          \
-    } while(0)
-#else
-#define FAIL(msg) do {                                                   \
-        fprintf(out_logfile, "%s: Process %d: FAILED at %d, %s: %s\n",   \
-                PrintTimestamp(), rank, __LINE__,                       \
-                msg, strerror(errno));                                   \
-        fflush(out_logfile);                                             \
-        MPI_Abort(testComm, 1);                                          \
-    } while(0)
-#endif
-
+void* safeMalloc(uint64_t size);
 void set_o_direct_flag(int *fd);
+
+ior_dataPacketType_e parsePacketType(char t);
+void update_write_memory_pattern(uint64_t item, char * buf, size_t bytes, int rand_seed, int rank, ior_dataPacketType_e dataPacketType);
+void generate_memory_pattern(char * buf, size_t bytes, int rand_seed, int rank, ior_dataPacketType_e dataPacketType);
+/* check a data buffer, @return 0 if all is correct, otherwise 1 */
+int verify_memory_pattern(uint64_t item, char * buffer, size_t bytes, int rand_seed, int pretendRank, ior_dataPacketType_e dataPacketType);
 
 char *CurrentTimeString(void);
 int Regex(char *, char *);
-void ShowFileSystemSize(char *);
+void ShowFileSystemSize(char * filename, const struct ior_aiori * backend, void * backend_options);
 void DumpBuffer(void *, size_t);
-void SeedRandGen(MPI_Comm);
 void SetHints (MPI_Info *, char *);
 void ShowHints (MPI_Info *);
 char *HumanReadable(IOR_offset_t value, int base);
-int CountTasksPerNode(MPI_Comm comm);
+int QueryNodeMapping(MPI_Comm comm, int print_nodemap);
+int GetNumNodes(MPI_Comm);
+int GetNumTasks(MPI_Comm);
+int GetNumTasksOnNode0(MPI_Comm);
 void DelaySecs(int delay);
+void updateParsedOptions(IOR_param_t * options, options_all_t * global_options);
+size_t NodeMemoryStringToBytes(char *size_str);
 
 /* Returns -1, if cannot be read  */
-int64_t ReadStoneWallingIterations(char * const filename);
+int64_t ReadStoneWallingIterations(char * const filename, MPI_Comm com);
 void StoreStoneWallingIterations(char * const filename, int64_t count);
 
-void init_clock(void);
+void init_clock(MPI_Comm com);
 double GetTimeStamp(void);
 char * PrintTimestamp(); // TODO remove this function
-
-extern double wall_clock_deviation;
-extern double wall_clock_delta;
+unsigned long GetProcessorAndCore(int *chip, int *core);
+void *aligned_buffer_alloc(size_t size, ior_memory_flags type);
+void aligned_buffer_free(void *buf, ior_memory_flags type);
 #endif  /* !_UTILITIES_H */

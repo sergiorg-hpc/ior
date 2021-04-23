@@ -35,20 +35,23 @@
     typedef void *rados_t;
     typedef void *rados_ioctx_t;
 #endif
-
+#include "option.h"
 #include "iordef.h"
-/******************** DATA Packet Type ***************************************/
-/* Holds the types of data packets: generic, offset, timestamp, incompressible */
+#include "aiori.h"
 
-enum PACKET_TYPE
-{
-    generic = 0,                /* No packet type specified */
-    timestamp=1,                  /* Timestamp packet set with -l */
-    offset=2,                     /* Offset packet set with -l */
-    incompressible=3              /* Incompressible packet set with -l */
+#include <mpi.h>
 
-};
+#ifndef MPI_FILE_NULL
+#   include <mpio.h>
+#endif /* not MPI_FILE_NULL */
 
+#define ISPOWEROFTWO(x) ((x != 0) && !(x & (x - 1)))
+
+typedef enum{
+    IOR_MEMORY_TYPE_CPU = 0,
+    IOR_MEMORY_TYPE_GPU_MANAGED = 1,
+    IOR_MEMORY_TYPE_GPU_DEVICE_ONLY = 2,
+} ior_memory_flags;
 
 
 /***************** IOR_BUFFERS *************************************************/
@@ -77,26 +80,29 @@ typedef struct IO_BUFFERS
  *         USER_GUIDE
  */
 
-struct ior_aiori;
-
 typedef struct
 {
     const struct ior_aiori * backend;
     char * debug;             /* debug info string */
-    unsigned int mode;               /* file permissions */
-    unsigned int openFlags;          /* open flags (see also <open>) */
     int referenceNumber;             /* user supplied reference number */
     char * api;               /* API for I/O */
     char * apiVersion;        /* API version */
     char * platform;          /* platform type */
     char * testFileName;   /* full name for test */
-    char * testFileName_fppReadCheck;/* filename for fpp read check */
-    char * hintsFileName;  /* full name for hints file */
     char * options;        /* options string */
+    // intermediate options
+    int collective;                  /* collective I/O */
+    MPI_Comm     testComm;           /* Current MPI communicator */
+    MPI_Comm     mpi_comm_world;           /* The global MPI communicator */
     int dryRun;                      /* do not perform any I/Os just run evtl. inputs print dummy output */
+    int dualMount;                   /* dual mount points */
+    ior_memory_flags gpuMemoryFlags;  /* use the GPU to store the data */
+    int gpuDirect;                /* use gpuDirect, this influences gpuMemoryFlags as well */
+    int gpuID;                       /* the GPU to use for gpuDirect or memory options */
     int numTasks;                    /* number of tasks for test */
-    int nodes;                       /* number of nodes for test */
-    int tasksPerNode;                /* number of tasks per node */
+    int numNodes;                    /* number of nodes for test */
+    int numTasksOnNode0;             /* number of tasks on node 0 (usually all the same, but don't have to be, use with caution) */
+    int tasksBlockMapping;           /* are the tasks in contiguous blocks across nodes or round-robin */
     int repetitions;                 /* number of repetitions of test */
     int repCounter;                  /* rep counter */
     int multiFile;                   /* multiple files */
@@ -115,25 +121,18 @@ typedef struct
     int keepFile;                    /* don't delete the testfile on exit */
     int keepFileWithError;           /* don't delete the testfile with errors */
     int errorFound;                  /* error found in data check */
-    int quitOnError;                 /* quit code when error in check */
-    int collective;                  /* collective I/O */
     IOR_offset_t segmentCount;       /* number of segments (or HDF5 datasets) */
     IOR_offset_t blockSize;          /* contiguous bytes to write per task */
     IOR_offset_t transferSize;       /* size of transfer in bytes */
-    IOR_offset_t offset;             /* offset for read/write */
     IOR_offset_t expectedAggFileSize; /* calculated aggregate file size */
-    int preallocate;                 /* preallocate file size */
-    int useFileView;                 /* use MPI_File_set_view */
-    int useSharedFilePointer;        /* use shared file pointer */
-    int useStridedDatatype;          /* put strided access into datatype */
-    int useO_DIRECT;                 /* use O_DIRECT, bypassing I/O buffers */
-    int showHints;                   /* show hints */
+    IOR_offset_t randomPrefillBlocksize;   /* prefill option for random IO, the amount of data used for prefill */
+
+    char * saveRankDetailsCSV;       /* save the details about the performance to a file */
     int summary_every_test;          /* flag to print summary every test, not just at end */
     int uniqueDir;                   /* use unique directory for each fpp */
     int useExistingTestFile;         /* do not delete test file before access */
-    int storeFileOffset;             /* use file offset as stored signature */
     int deadlineForStonewalling;     /* max time in seconds to run any test phase */
-    int stoneWallingWearOut;         /* wear out the stonewalling, once the timout is over, each process has to write the same amount */
+    int stoneWallingWearOut;         /* wear out the stonewalling, once the timeout is over, each process has to write the same amount */
     uint64_t stoneWallingWearOutIterations; /* the number of iterations for the stonewallingWearOut, needed for readBack */
     char * stoneWallingStatusFile;
 
@@ -142,70 +141,34 @@ typedef struct
     int verbose;                     /* verbosity */
     int setTimeStampSignature;       /* set time stamp signature */
     unsigned int timeStampSignatureValue; /* value for time stamp signature */
-    void * fd_fppReadCheck;          /* additional fd for fpp read check */
     int randomSeed;                  /* random seed for write/read check */
     unsigned int incompressibleSeed; /* random seed for incompressible file creation */
     int randomOffset;                /* access is to random offsets */
     size_t memoryPerTask;            /* additional memory used per task */
     size_t memoryPerNode;            /* additional memory used per node */
-    enum PACKET_TYPE dataPacketType;             /* The type of data packet.  */
+    char * memoryPerNodeStr;         /* for parsing */
+    char * testscripts;              /* for parsing */
+    char * buffer_type;              /* for parsing */
+    ior_dataPacketType_e dataPacketType; /* The type of data packet.  */
 
+    void * backend_options;          /* Backend-specific options */
 
     /* POSIX variables */
     int singleXferAttempt;           /* do not retry transfer if incomplete */
     int fsyncPerWrite;               /* fsync() after each write */
     int fsync;                       /* fsync() after write */
 
-    void* mmap_ptr;
-
-    /* MPI variables */
-    MPI_Comm     testComm;           /* MPI communicator */
-    MPI_Datatype transferType;       /* datatype for transfer */
-    MPI_Datatype fileType;           /* filetype for file view */
-
-    /* HDF5 variables */
-    int individualDataSets;          /* datasets not shared by all procs */
-    int noFill;                      /* no fill in file creation */
-    IOR_offset_t setAlignment;       /* alignment in bytes */
-
-    /* HDFS variables */
-    char      * hdfs_user;  /* copied from ENV, for now */
-    const char* hdfs_name_node;
-    tPort       hdfs_name_node_port; /* (uint16_t) */
-    hdfsFS      hdfs_fs;             /* file-system handle */
-    int         hdfs_replicas;       /* n block replicas.  (0 gets default) */
-    int         hdfs_block_size;     /* internal blk-size. (0 gets default) */
-
     char*       URI;                 /* "path" to target object */
-    size_t      part_number;         /* multi-part upload increment (PER-RANK!) */
-    char*       UploadId; /* key for multi-part-uploads */
-    int         collective_md;       /* use collective metatata optimization */
- 
 
     /* RADOS variables */
     rados_t rados_cluster;           /* RADOS cluster handle */
     rados_ioctx_t rados_ioctx;       /* I/O context for our pool in the RADOS cluster */
 
-    /* NCMPI variables */
-    int var_id;                      /* variable id handle for data set */
-
-    /* Lustre variables */
-    int lustre_stripe_count;
-    int lustre_stripe_size;
-    int lustre_start_ost;
-    int lustre_set_striping;         /* flag that we need to set lustre striping */
-    int lustre_ignore_locks;
-
-    /* gpfs variables */
-    int gpfs_hint_access;          /* use gpfs "access range" hint */
-    int gpfs_release_token;        /* immediately release GPFS tokens after
-                                      creating or opening a file */
-    /* beegfs variables */
-    int beegfs_numTargets;           /* number storage targets to use */
-    int beegfs_chunkSize;            /* srtipe pattern for new files */
-
     int id;                          /* test's unique ID */
     int intraTestBarriers;           /* barriers between open/op and op/close */
+    int warningAsErrors;             /* treat any warning as an error */
+
+    aiori_xfer_hint_t hints;
 } IOR_param_t;
 
 /* each pointer for a single test */
@@ -214,8 +177,9 @@ typedef struct {
    size_t pairs_accessed; // number of I/Os done, useful for deadlineForStonewalling
 
    double     stonewall_time;
-   long long  stonewall_min_data_accessed;
-   long long  stonewall_avg_data_accessed;
+   long long  stonewall_min_data_accessed; // of all processes
+   long long  stonewall_avg_data_accessed; // across all processes
+   long long  stonewall_total_data_accessed; // sum accross all processes
 
    IOR_offset_t aggFileSizeFromStat;
    IOR_offset_t aggFileSizeFromXfer;
@@ -238,8 +202,8 @@ typedef struct IOR_test_t {
 IOR_test_t *CreateTest(IOR_param_t *init_params, int test_num);
 void AllocResults(IOR_test_t *test);
 
-char * GetPlatformName();
-void init_IOR_Param_t(IOR_param_t *p);
+char * GetPlatformName(void);
+void init_IOR_Param_t(IOR_param_t *p, MPI_Comm global_com);
 
 /*
  * This function runs IOR given by command line, useful for testing

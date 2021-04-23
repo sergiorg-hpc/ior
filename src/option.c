@@ -7,6 +7,23 @@
 
 #include <option.h>
 
+
+/* merge two option lists and return the total size */
+option_help * option_merge(option_help * a, option_help * b){
+  int count_a = 0;
+  for(option_help * i = a; i->type != 0; i++){
+    count_a++;
+  }
+  int count = count_a + 1; // LAST_OPTION is one
+  for(option_help * i = b; i->type != 0; i++){
+    count++;
+  }
+  option_help * h = malloc(sizeof(option_help) * count);
+  memcpy(h, a, sizeof(option_help) * count_a);
+  memcpy(h + count_a, b, sizeof(option_help) * (count - count_a));
+  return h;
+}
+
 /*
 * Takes a string of the form 64, 8m, 128k, 4g, etc. and converts to bytes.
 */
@@ -87,6 +104,10 @@ static int print_value(option_help * o){
       }
       case('l'):{
         pos += printf("=%lld", *(long long*) o->variable);
+        break;
+      }
+      case('u'):{
+        pos += printf("=%lu", *(uint64_t*) o->variable);
         break;
       }
     }
@@ -180,6 +201,10 @@ static int print_option_value(option_help * o){
         pos += printf("=%lld", *(long long*) o->variable);
         break;
       }
+      case('u'):{
+        pos += printf("=%lu", *(uint64_t*) o->variable);
+        break;
+      }
     }
   }else{
     //printf(" ");
@@ -220,33 +245,35 @@ void option_print_current(option_help * args){
   print_current_option_section(args, OPTION_FLAG);
 }
 
-int option_parse(int argc, char ** argv, options_all * opt_all){
-  int error = 0;
-  int requiredArgsSeen = 0;
-  int requiredArgsNeeded = 0;
-  int i;
-  int printhelp = 0;
+static void option_parse_token(char ** argv, int * flag_parsed_next, int * requiredArgsSeen, options_all_t * opt_all, int * error, int * print_help){
+  char * txt = argv[0];
+  char * arg = strstr(txt, "=");
 
-  for(int m = 0; m < opt_all->module_count; m++ ){
-    option_help * args = opt_all->modules[m].options;
-    if(args == NULL) continue;
-    for(option_help * o = args; o->shortVar != 0 || o->longVar != 0 ; o++ ){
-      if(o->arg == OPTION_REQUIRED_ARGUMENT){
-        requiredArgsNeeded++;
-      }
-    }
+  int replaced_equal = 0;
+  int i = 0;
+  if(arg != NULL){
+    arg[0] = 0;
+    replaced_equal = 1;
+
+    // Check empty value
+    arg = (arg[1] == 0) ? NULL : arg + 1;
   }
+  *flag_parsed_next = 0;
 
-  for(i=1; i < argc; i++){
-    char * txt = argv[i];
-    int foundOption = 0;
-    char * arg = strstr(txt, "=");
-    int replaced_equal = 0;
-    if(arg != NULL){
-      arg[0] = 0;
-      arg++;
-      replaced_equal = 1;
-    }
+  // just skip over the first dash so we don't have to handle it everywhere below
+  if(txt[0] != '-'){
+      *error = 1;
+      return;
+  }
+  txt++;
+  int parsed = 0;
+  
+  // printf("Parsing: %s : %s\n", txt, arg);
+  // support groups of multiple flags like -vvv or -vq
+  for(int flag_index = 0; flag_index < strlen(txt); ++flag_index){
+    // don't loop looking for multiple flags if we already processed a long option
+    if(txt[flag_index] == '=' || (txt[0] == '-' && flag_index > 0))
+        break;
 
     for(int m = 0; m < opt_all->module_count; m++ ){
       option_help * args = opt_all->modules[m].options;
@@ -257,26 +284,31 @@ int option_parse(int argc, char ** argv, options_all * opt_all){
           // section
           continue;
         }
-        if ( (txt[0] == '-' && o->shortVar == txt[1]) || (strlen(txt) > 2 && txt[0] == '-' && txt[1] == '-' && o->longVar != NULL && strcmp(txt + 2, o->longVar) == 0)){
-          foundOption = 1;
-
+        if ( (o->shortVar == txt[flag_index]) || (strlen(txt) > 2 && txt[0] == '-' && o->longVar != NULL && strcmp(txt + 1, o->longVar) == 0)){
+          //  printf("Found %s %c=%c? %d %d\n", o->help, o->shortVar, txt[flag_index], (o->shortVar == txt[flag_index]), (strlen(txt) > 2 && txt[0] == '-' && o->longVar != NULL && strcmp(txt + 1, o->longVar) == 0));
           // now process the option.
           switch(o->arg){
             case (OPTION_FLAG):{
               assert(o->type == 'd');
-              (*(int*) o->variable)++;
+              if(arg != NULL){
+                int val = atoi(arg);
+                (*(int*) o->variable) = (val < 0) ? 0 : val;
+              }else{
+                (*(int*) o->variable)++;
+              }
               break;
             }
             case (OPTION_OPTIONAL_ARGUMENT):
             case (OPTION_REQUIRED_ARGUMENT):{
               // check if next is an argument
-              if(arg == NULL){
-                if(o->shortVar == txt[1] && txt[2] != 0){
-                  arg = & txt[2];
+              if(arg == NULL && replaced_equal != 1){
+                if(o->shortVar == txt[0] && txt[1] != 0){
+                  arg = & txt[1];
                 }else{
                   // simply take the next value as argument
                   i++;
-                  arg = argv[i];
+                  arg = argv[1];
+                  *flag_parsed_next = 1;
                 }
               }
 
@@ -325,8 +357,13 @@ int option_parse(int argc, char ** argv, options_all * opt_all){
                   *(long long*) o->variable = string_to_bytes(arg);
                   break;
                 }
+                case('u'):{
+                  *(uint64_t*) o->variable = string_to_bytes(arg);
+                  break;
+                }
                 default:
                   printf("ERROR: Unknown option type %c\n", o->type);
+                  break;
               }
             }
           }
@@ -335,31 +372,81 @@ int option_parse(int argc, char ** argv, options_all * opt_all){
           }
 
           if(o->arg == OPTION_REQUIRED_ARGUMENT){
-            requiredArgsSeen++;
+            (*requiredArgsSeen)++;
           }
 
-          break;
+          parsed = 1;
         }
       }
     }
-    if (! foundOption){
-        if(strcmp(txt, "-h") == 0 || strcmp(txt, "--help") == 0){
-          printhelp = 1;
-        }else{
-          printf("Error invalid argument: %s\n", txt);
-          error = 1;
-        }
+  }
+  if(parsed) return;
+  
+  if(strcmp(txt, "h") == 0 || strcmp(txt, "-help") == 0){
+    *print_help = 1;
+  }else{
+    *error = 1;
+  }
+}
+
+int option_parse_str(char*val, options_all_t * opt_all){
+    int flag_parsed_next;
+    int error = 0;
+    int requiredArgsSeen = 0;
+    int print_help = 0;
+    char * argv[2] = {val, NULL};
+    option_parse_token(argv, & flag_parsed_next, & requiredArgsSeen, opt_all, & error, & print_help);
+    return error;
+}
+
+int option_parse_key_value(char * key, char *val, options_all_t * opt_all){
+  int flag_parsed_next;
+  int error = 0;
+  int requiredArgsSeen = 0;
+  int print_help = 0;
+  char value[1024];
+  sprintf(value, "%s=%s", key, val);
+  char * argv[2] = {value, NULL};
+  option_parse_token(argv, & flag_parsed_next, & requiredArgsSeen, opt_all, & error, & print_help);
+  return error;
+}
+
+int option_parse(int argc, char ** argv, options_all_t * opt_all){
+  int error = 0;
+  int requiredArgsSeen = 0;
+  int requiredArgsNeeded = 0;
+  int i;
+  int printhelp = 0;
+
+  for(int m = 0; m < opt_all->module_count; m++ ){
+    option_help * args = opt_all->modules[m].options;
+    if(args == NULL) continue;
+    for(option_help * o = args; o->shortVar != 0 || o->longVar != 0 ; o++ ){
+      if(o->arg == OPTION_REQUIRED_ARGUMENT){
+        requiredArgsNeeded++;
+      }
+    }
+  }
+
+  for(i=1; i < argc; i++){
+    int flag_parsed_next;
+    option_parse_token(& argv[i], & flag_parsed_next, & requiredArgsSeen, opt_all, & error, & printhelp);
+    if (flag_parsed_next){
+      i++;
+    }
+    if(error){
+      printf("Error invalid argument: %s\n", argv[i]);
     }
   }
 
   if( requiredArgsSeen != requiredArgsNeeded ){
     printf("Error: Missing some required arguments\n\n");
-    printhelp = -1;
+    printhelp = 1;
   }
 
   if(error != 0){
     printf("Invalid options\n");
-    printhelp = -1;
+    printhelp = 1;
   }
 
   if(printhelp == 1){

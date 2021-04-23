@@ -15,17 +15,11 @@
 #ifndef _AIORI_H
 #define _AIORI_H
 
-#include <mpi.h>
-
-#ifndef MPI_FILE_NULL
-#   include <mpio.h>
-#endif /* not MPI_FILE_NULL */
-
 #include <sys/stat.h>
 #include <stdbool.h>
 
-#include "ior.h"
 #include "iordef.h"                                     /* IOR Definitions */
+#include "aiori-debug.h"
 #include "option.h"
 
 /*************************** D E F I N I T I O N S ****************************/
@@ -63,27 +57,61 @@ typedef struct ior_aiori_statfs {
         uint64_t f_ffree;
 } ior_aiori_statfs_t;
 
+/*
+ This structure contains information about the expected IO pattern that may be used to optimize data access. Optimally, it should be stored for each file descriptor, at the moment it can only be set globally per aiori backend module.
+ */
+typedef struct aiori_xfer_hint_t{
+  int dryRun;                      /* do not perform any I/Os just run evtl. inputs print dummy output */
+  int filePerProc;                 /* single file or file-per-process */
+  int collective;                  /* collective I/O */
+  int numTasks;                    /* number of tasks for test */
+  int numNodes;                    /* number of nodes for test */
+  int randomOffset;                /* access is to random offsets */
+  int fsyncPerWrite;               /* fsync() after each write */
+  IOR_offset_t segmentCount;       /* number of segments (or HDF5 datasets) */
+  IOR_offset_t blockSize;          /* contiguous bytes to write per task */
+  IOR_offset_t transferSize;       /* size of transfer in bytes */
+  IOR_offset_t expectedAggFileSize; /* calculated aggregate file size */
+  int singleXferAttempt;           /* do not retry transfer if incomplete */
+} aiori_xfer_hint_t;
+
+/* this is a dummy structure to create some type safety */
+struct aiori_mod_opt_t{
+  void * dummy;
+};
+
+typedef struct aiori_fd_t{
+  void * dummy;
+} aiori_fd_t;
 
 typedef struct ior_aiori {
         char *name;
         char *name_legacy;
-        void *(*create)(char *, IOR_param_t *);
-        void *(*open)(char *, IOR_param_t *);
-        IOR_offset_t (*xfer)(int, void *, IOR_size_t *,
-                             IOR_offset_t, IOR_param_t *);
-        void (*close)(void *, IOR_param_t *);
-        void (*delete)(char *, IOR_param_t *);
-        char* (*get_version)();
-        void (*fsync)(void *, IOR_param_t *);
-        IOR_offset_t (*get_file_size)(IOR_param_t *, MPI_Comm, char *);
-        int (*statfs) (const char *, ior_aiori_statfs_t *, IOR_param_t * param);
-        int (*mkdir) (const char *path, mode_t mode, IOR_param_t * param);
-        int (*rmdir) (const char *path, IOR_param_t * param);
-        int (*access) (const char *path, int mode, IOR_param_t * param);
-        int (*stat) (const char *path, struct stat *buf, IOR_param_t * param);
-        void (*initialize)(); /* called once per program before MPI is started */
-        void (*finalize)(); /* called once per program after MPI is shutdown */
-        option_help * (*get_options)();
+        aiori_fd_t *(*create)(char *, int iorflags, aiori_mod_opt_t *);
+        int (*mknod)(char *);
+        aiori_fd_t *(*open)(char *, int iorflags, aiori_mod_opt_t *);
+        /*
+         Allow to set generic transfer options that shall be applied to any subsequent IO call.
+        */
+        void (*xfer_hints)(aiori_xfer_hint_t * params);
+        IOR_offset_t (*xfer)(int access, aiori_fd_t *, IOR_size_t *,
+                             IOR_offset_t size, IOR_offset_t offset, aiori_mod_opt_t * module_options);
+        void (*close)(aiori_fd_t *, aiori_mod_opt_t * module_options);
+        void (*delete)(char *, aiori_mod_opt_t * module_options);
+        char* (*get_version)(void);
+        void (*fsync)(aiori_fd_t *, aiori_mod_opt_t * module_options);
+        IOR_offset_t (*get_file_size)(aiori_mod_opt_t * module_options, char * filename);
+        int (*statfs) (const char *, ior_aiori_statfs_t *, aiori_mod_opt_t * module_options);
+        int (*mkdir) (const char *path, mode_t mode, aiori_mod_opt_t * module_options);
+        int (*rmdir) (const char *path, aiori_mod_opt_t * module_options);
+        int (*access) (const char *path, int mode, aiori_mod_opt_t * module_options);
+        int (*stat) (const char *path, struct stat *buf, aiori_mod_opt_t * module_options);
+        void (*initialize)(aiori_mod_opt_t * options); /* called once per program before MPI is started */
+        void (*finalize)(aiori_mod_opt_t * options); /* called once per program after MPI is shutdown */
+        int (*rename) (const char *oldpath, const char *newpath, aiori_mod_opt_t * module_options);
+        option_help * (*get_options)(aiori_mod_opt_t ** init_backend_options, aiori_mod_opt_t* init_values); /* initializes the backend options as well and returns the pointer to the option help structure */
+        int (*check_params)(aiori_mod_opt_t *); /* check if the provided module_optionseters for the given test and the module options are correct, if they aren't print a message and exit(1) or return 1*/
+        void (*sync)(aiori_mod_opt_t * ); /* synchronize every pending operation for this storage */
         bool enable_mdtest;
 } ior_aiori_t;
 
@@ -93,44 +121,47 @@ enum bench_type {
 };
 
 extern ior_aiori_t dummy_aiori;
+extern ior_aiori_t aio_aiori;
+extern ior_aiori_t daos_aiori;
+extern ior_aiori_t dfs_aiori;
 extern ior_aiori_t hdf5_aiori;
 extern ior_aiori_t hdfs_aiori;
 extern ior_aiori_t ime_aiori;
 extern ior_aiori_t mpiio_aiori;
 extern ior_aiori_t ncmpi_aiori;
 extern ior_aiori_t posix_aiori;
+extern ior_aiori_t pmdk_aiori;
 extern ior_aiori_t mmap_aiori;
-extern ior_aiori_t s3_aiori;
+extern ior_aiori_t S3_libS3_aiori;
+extern ior_aiori_t s3_4c_aiori;
 extern ior_aiori_t s3_plus_aiori;
 extern ior_aiori_t s3_emc_aiori;
 extern ior_aiori_t rados_aiori;
+extern ior_aiori_t cephfs_aiori;
+extern ior_aiori_t gfarm_aiori;
 
-void aiori_initialize(IOR_test_t * tests);
-void aiori_finalize(IOR_test_t * tests);
 const ior_aiori_t *aiori_select (const char *api);
 int aiori_count (void);
 void aiori_supported_apis(char * APIs, char * APIs_legacy, enum bench_type type);
-void airoi_parse_options(int argc, char ** argv, option_help * global_options);
+options_all_t * airoi_create_all_module_options(option_help * global_options);
+
+void * airoi_update_module_options(const ior_aiori_t * backend, options_all_t * module_defaults);
+
 const char *aiori_default (void);
 
 /* some generic POSIX-based backend calls */
-char * aiori_get_version();
-int aiori_posix_statfs (const char *path, ior_aiori_statfs_t *stat_buf, IOR_param_t * param);
-int aiori_posix_mkdir (const char *path, mode_t mode, IOR_param_t * param);
-int aiori_posix_rmdir (const char *path, IOR_param_t * param);
-int aiori_posix_access (const char *path, int mode, IOR_param_t * param);
-int aiori_posix_stat (const char *path, struct stat *buf, IOR_param_t * param);
+char * aiori_get_version (void);
+int aiori_posix_statfs (const char *path, ior_aiori_statfs_t *stat_buf, aiori_mod_opt_t * module_options);
+int aiori_posix_mkdir (const char *path, mode_t mode, aiori_mod_opt_t * module_options);
+int aiori_posix_rmdir (const char *path, aiori_mod_opt_t * module_options);
+int aiori_posix_access (const char *path, int mode, aiori_mod_opt_t * module_options);
+int aiori_posix_stat (const char *path, struct stat *buf, aiori_mod_opt_t * module_options);
 
-void *POSIX_Create(char *testFileName, IOR_param_t * param);
-void *POSIX_Open(char *testFileName, IOR_param_t * param);
-IOR_offset_t POSIX_GetFileSize(IOR_param_t * test, MPI_Comm testComm, char *testFileName);
-void POSIX_Delete(char *testFileName, IOR_param_t * param);
-void POSIX_Close(void *fd, IOR_param_t * param);
 
-/* NOTE: these 3 MPI-IO functions are exported for reuse by HDF5/PNetCDF */
-void MPIIO_Delete(char *testFileName, IOR_param_t * param);
-IOR_offset_t MPIIO_GetFileSize(IOR_param_t * test, MPI_Comm testComm,
-                               char *testFileName);
-int MPIIO_Access(const char *, int, IOR_param_t *);
+/* NOTE: these 4 MPI-IO functions are exported for reuse by HDF5/PNetCDF */
+void MPIIO_Delete(char *testFileName, aiori_mod_opt_t * module_options);
+IOR_offset_t MPIIO_GetFileSize(aiori_mod_opt_t * options, char *testFileName);
+int MPIIO_Access(const char *, int, aiori_mod_opt_t * module_options);
+void MPIIO_xfer_hints(aiori_xfer_hint_t * params);
 
 #endif /* not _AIORI_H */

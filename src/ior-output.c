@@ -18,8 +18,10 @@ static void PrintNextToken();
 void PrintTableHeader(){
   if (outputFormat == OUTPUT_DEFAULT){
     fprintf(out_resultfile, "\n");
-    fprintf(out_resultfile, "access    bw(MiB/s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter\n");
-    fprintf(out_resultfile, "------    ---------  ---------- ---------  --------   --------   --------   --------   ----\n");
+    fprintf(out_resultfile, "access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter\n");
+    fprintf(out_resultfile, "------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----\n");
+  }else if(outputFormat == OUTPUT_CSV){
+    fprintf(out_resultfile, "access,bw(MiB/s),IOPS,Latency,block(KiB),xfer(KiB),open(s),wr/rd(s),close(s),total(s),numTasks,iter\n");
   }
 }
 
@@ -45,8 +47,6 @@ static void PrintKeyValStart(char * key){
   }
   if(outputFormat == OUTPUT_JSON){
     fprintf(out_resultfile, "\"%s\": \"", key);
-  }else if(outputFormat == OUTPUT_CSV){
-
   }
 }
 
@@ -84,7 +84,7 @@ static void PrintKeyVal(char * key, char * value){
   if(outputFormat == OUTPUT_JSON){
     fprintf(out_resultfile, "\"%s\": \"%s\"", key, value);
   }else if(outputFormat == OUTPUT_CSV){
-    fprintf(out_resultfile, "%s", value);
+    fprintf(out_resultfile, "%s,", value);
   }
 }
 
@@ -98,7 +98,7 @@ static void PrintKeyValDouble(char * key, double value){
   if(outputFormat == OUTPUT_JSON){
     fprintf(out_resultfile, "\"%s\": %.4f", key, value);
   }else if(outputFormat == OUTPUT_CSV){
-    fprintf(out_resultfile, "%.4f", value);
+    fprintf(out_resultfile, "%.4f,", value);
   }
 }
 
@@ -113,7 +113,7 @@ static void PrintKeyValInt(char * key, int64_t value){
   if(outputFormat == OUTPUT_JSON){
     fprintf(out_resultfile, "\"%s\": %lld", key, (long long)  value);
   }else if(outputFormat == OUTPUT_CSV){
-    fprintf(out_resultfile, "%lld", (long long) value);
+    fprintf(out_resultfile, "%lld,", (long long) value);
   }
 }
 
@@ -203,14 +203,17 @@ void PrintRepeatEnd(){
 void PrintRepeatStart(){
   if (rank != 0)
           return;
-  if( outputFormat == OUTPUT_DEFAULT){
+  if(outputFormat == OUTPUT_DEFAULT){
     return;
   }
   PrintArrayStart();
 }
 
 void PrintTestEnds(){
-  if (rank != 0 ||  verbose < VERBOSE_0) {
+  if (outputFormat == OUTPUT_CSV){
+      return;
+  }
+  if (rank != 0 ||  verbose <= VERBOSE_0) {
     PrintEndSection();
     return;
   }
@@ -219,10 +222,13 @@ void PrintTestEnds(){
   PrintEndSection();
 }
 
-void PrintReducedResult(IOR_test_t *test, int access, double bw, double *diff_subset, double totalTime, int rep){
+void PrintReducedResult(IOR_test_t *test, int access, double bw, double iops, double latency,
+			double *diff_subset, double totalTime, int rep){
   if (outputFormat == OUTPUT_DEFAULT){
     fprintf(out_resultfile, "%-10s", access == WRITE ? "write" : "read");
     PPDouble(1, bw / MEBIBYTE, " ");
+    PPDouble(1, iops, " ");
+    PPDouble(1, latency, "  ");
     PPDouble(1, (double)test->params.blockSize / KIBIBYTE, " ");
     PPDouble(1, (double)test->params.transferSize / KIBIBYTE, " ");
     PPDouble(1, diff_subset[0], " ");
@@ -236,12 +242,28 @@ void PrintReducedResult(IOR_test_t *test, int access, double bw, double *diff_su
     PrintKeyValDouble("bwMiB", bw / MEBIBYTE);
     PrintKeyValDouble("blockKiB", (double)test->params.blockSize / KIBIBYTE);
     PrintKeyValDouble("xferKiB", (double)test->params.transferSize / KIBIBYTE);
+    PrintKeyValDouble("iops", iops);
+    PrintKeyValDouble("latency", latency);
     PrintKeyValDouble("openTime", diff_subset[0]);
     PrintKeyValDouble("wrRdTime", diff_subset[1]);
     PrintKeyValDouble("closeTime", diff_subset[2]);
     PrintKeyValDouble("totalTime", totalTime);
     PrintEndSection();
+  }else if (outputFormat == OUTPUT_CSV){
+    PrintKeyVal("access", access == WRITE ? "write" : "read");
+    PrintKeyValDouble("bwMiB", bw / MEBIBYTE);
+    PrintKeyValDouble("iops", iops);
+    PrintKeyValDouble("latency", latency);
+    PrintKeyValDouble("blockKiB", (double)test->params.blockSize / KIBIBYTE);
+    PrintKeyValDouble("xferKiB", (double)test->params.transferSize / KIBIBYTE);
+    PrintKeyValDouble("openTime", diff_subset[0]);
+    PrintKeyValDouble("wrRdTime", diff_subset[1]);
+    PrintKeyValDouble("closeTime", diff_subset[2]);
+    PrintKeyValDouble("totalTime", totalTime);
+    PrintKeyValInt("Numtasks", test->params.numTasks);
+    fprintf(out_resultfile, "%d\n", rep);
   }
+
   fflush(out_resultfile);
 }
 
@@ -253,11 +275,15 @@ void PrintHeader(int argc, char **argv)
         if (rank != 0)
                 return;
 
+        if (outputFormat == OUTPUT_CSV){
+            return;
+        }
+
         PrintStartSection();
         if (outputFormat != OUTPUT_DEFAULT){
           PrintKeyVal("Version", META_VERSION);
         }else{
-          printf("IOR-" META_VERSION ": MPI Coordinated Test of Parallel I/O\n");
+          fprintf(out_resultfile, "IOR-" META_VERSION ": MPI Coordinated Test of Parallel I/O\n");
         }
         PrintKeyVal("Began", CurrentTimeString());
         PrintKeyValStart("Command line");
@@ -279,23 +305,6 @@ void PrintHeader(int argc, char **argv)
                 }
                 PrintKeyValEnd();
         }
-
-#ifdef _NO_MPI_TIMER
-        if (verbose >= VERBOSE_2)
-                fprintf(out_logfile, "Using unsynchronized POSIX timer\n");
-#else                           /* not _NO_MPI_TIMER */
-        if (MPI_WTIME_IS_GLOBAL) {
-                if (verbose >= VERBOSE_2)
-                    fprintf(out_logfile, "Using synchronized MPI timer\n");
-        } else {
-                if (verbose >= VERBOSE_2)
-                  fprintf(out_logfile, "Using unsynchronized MPI timer\n");
-        }
-#endif                          /* _NO_MPI_TIMER */
-        if (verbose >= VERBOSE_1) {
-                fprintf(out_logfile, "Start time skew across all tasks: %.02f sec\n",
-                        wall_clock_deviation);
-        }
         if (verbose >= VERBOSE_3) {     /* show env */
                 fprintf(out_logfile, "STARTING ENVIRON LOOP\n");
                 for (i = 0; environ[i] != NULL; i++) {
@@ -314,13 +323,16 @@ void PrintHeader(int argc, char **argv)
  */
 void ShowTestStart(IOR_param_t *test)
 {
+  if (outputFormat == OUTPUT_CSV){
+      return;
+  }
   PrintStartSection();
   PrintKeyValInt("TestID", test->id);
   PrintKeyVal("StartTime", CurrentTimeString());
-  /* if pvfs2:, then skip */
-  if (Regex(test->testFileName, "^[a-z][a-z].*:") == 0) {
-      DisplayFreespace(test);
-  }
+
+  char filename[MAX_PATHLEN];
+  GetTestFileName(filename, test);
+  ShowFileSystemSize(filename, test->backend, test->backend_options);
 
   if (verbose >= VERBOSE_3 || outputFormat == OUTPUT_JSON) {
     char* data_packets[] = {"g","t","o","i"};
@@ -331,7 +343,6 @@ void ShowTestStart(IOR_param_t *test)
     PrintKeyVal("api", test->api);
     PrintKeyVal("platform", test->platform);
     PrintKeyVal("testFileName", test->testFileName);
-    PrintKeyVal("hintsFileName", test->hintsFileName);
     PrintKeyValInt("deadlineForStonewall", test->deadlineForStonewalling);
     PrintKeyValInt("stoneWallingWearOut", test->stoneWallingWearOut);
     PrintKeyValInt("maxTimeDuration", test->maxTimeDuration);
@@ -339,19 +350,17 @@ void ShowTestStart(IOR_param_t *test)
 
     PrintKeyVal("options", test->options);
     PrintKeyValInt("dryRun", test->dryRun);
-    PrintKeyValInt("nodes", test->nodes);
+    PrintKeyValInt("nodes", test->numNodes);
     PrintKeyValInt("memoryPerTask", (unsigned long) test->memoryPerTask);
     PrintKeyValInt("memoryPerNode", (unsigned long) test->memoryPerNode);
-    PrintKeyValInt("tasksPerNode", tasksPerNode);
+    PrintKeyValInt("tasksPerNode", test->numTasksOnNode0);
     PrintKeyValInt("repetitions", test->repetitions);
     PrintKeyValInt("multiFile", test->multiFile);
     PrintKeyValInt("interTestDelay", test->interTestDelay);
     PrintKeyValInt("fsync", test->fsync);
     PrintKeyValInt("fsyncperwrite", test->fsyncPerWrite);
     PrintKeyValInt("useExistingTestFile", test->useExistingTestFile);
-    PrintKeyValInt("showHints", test->showHints);
     PrintKeyValInt("uniqueDir", test->uniqueDir);
-    PrintKeyValInt("individualDataSets", test->individualDataSets);
     PrintKeyValInt("singleXferAttempt", test->singleXferAttempt);
     PrintKeyValInt("readFile", test->readFile);
     PrintKeyValInt("writeFile", test->writeFile);
@@ -362,25 +371,19 @@ void ShowTestStart(IOR_param_t *test)
     PrintKeyValInt("randomOffset", test->randomOffset);
     PrintKeyValInt("checkWrite", test->checkWrite);
     PrintKeyValInt("checkRead", test->checkRead);
-    PrintKeyValInt("preallocate", test->preallocate);
-    PrintKeyValInt("useFileView", test->useFileView);
-    PrintKeyValInt("setAlignment", test->setAlignment);
-    PrintKeyValInt("storeFileOffset", test->storeFileOffset);
-    PrintKeyValInt("useSharedFilePointer", test->useSharedFilePointer);
-    PrintKeyValInt("useO_DIRECT", test->useO_DIRECT);
-    PrintKeyValInt("useStridedDatatype", test->useStridedDatatype);
+    PrintKeyValInt("dataPacketType", test->dataPacketType);
     PrintKeyValInt("keepFile", test->keepFile);
     PrintKeyValInt("keepFileWithError", test->keepFileWithError);
-    PrintKeyValInt("quitOnError", test->quitOnError);
+    PrintKeyValInt("warningAsErrors", test->warningAsErrors);
     PrintKeyValInt("verbose", verbose);
     PrintKeyVal("data packet type", data_packets[test->dataPacketType]);
     PrintKeyValInt("setTimeStampSignature/incompressibleSeed", test->setTimeStampSignature); /* Seed value was copied into setTimeStampSignature as well */
     PrintKeyValInt("collective", test->collective);
     PrintKeyValInt("segmentCount", test->segmentCount);
-    #ifdef HAVE_GPFS_FCNTL_H
-    PrintKeyValInt("gpfsHintAccess", test->gpfs_hint_access);
-    PrintKeyValInt("gpfsReleaseToken", test->gpfs_release_token);
-    #endif
+    //#ifdef HAVE_GPFS_FCNTL_H
+    //PrintKeyValInt("gpfsHintAccess", test->gpfs_hint_access);
+    //PrintKeyValInt("gpfsReleaseToken", test->gpfs_release_token);
+    //#endif
     PrintKeyValInt("transferSize", test->transferSize);
     PrintKeyValInt("blockSize", test->blockSize);
     PrintEndSection();
@@ -407,6 +410,9 @@ void ShowTestEnd(IOR_test_t *tptr){
  */
 void ShowSetup(IOR_param_t *params)
 {
+  if (outputFormat == OUTPUT_CSV){
+      return;
+  }
   if (params->debug) {
       fprintf(out_logfile, "\n*** DEBUG MODE ***\n");
       fprintf(out_logfile, "*** %s ***\n\n", params->debug);
@@ -431,8 +437,9 @@ void ShowSetup(IOR_param_t *params)
     PrintKeyValInt("task offset", params->taskPerNodeOffset);
     PrintKeyValInt("reorder random seed", params->reorderTasksRandomSeed);
   }
+  PrintKeyValInt("nodes", params->numNodes);
   PrintKeyValInt("tasks", params->numTasks);
-  PrintKeyValInt("clients per node", params->tasksPerNode);
+  PrintKeyValInt("clients per node", params->numTasksOnNode0);
   if (params->memoryPerTask != 0){
     PrintKeyVal("memoryPerTask", HumanReadable(params->memoryPerTask, BASE_TWO));
   }
@@ -446,14 +453,10 @@ void ShowSetup(IOR_param_t *params)
   if(params->dryRun){
     PrintKeyValInt("dryRun", params->dryRun);
   }
-
-#ifdef HAVE_LUSTRE_LUSTRE_USER_H
-  if (params->lustre_set_striping) {
-    PrintKeyVal("Lustre stripe size", ((params->lustre_stripe_size == 0) ? "Use default" :
-     HumanReadable(params->lustre_stripe_size, BASE_TWO)));
-    PrintKeyVal("stripe count", (params->lustre_stripe_count == 0 ? "Use default" : HumanReadable(params->lustre_stripe_count, BASE_TWO)));
+  if(params->verbose) {
+    PrintKeyValInt("verbose", params->verbose);
   }
-#endif /* HAVE_LUSTRE_LUSTRE_USER_H */
+
   if (params->deadlineForStonewalling > 0) {
     PrintKeyValInt("stonewallingTime", params->deadlineForStonewalling);
     PrintKeyValInt("stoneWallingWearOut", params->stoneWallingWearOut );
@@ -529,16 +532,20 @@ static void PrintLongSummaryOneOperation(IOR_test_t *test, const int access)
         struct results *ops;
 
         int reps;
-        if (rank != 0 || verbose < VERBOSE_0)
+        if (rank != 0 || verbose <= VERBOSE_0)
                 return;
 
         reps = params->repetitions;
 
         double * times = malloc(sizeof(double)* reps);
+        long long  stonewall_avg_data_accessed = 0;
+        double stonewall_time = 0;
         for(int i=0; i < reps; i++){
                 IOR_point_t *point = (access == WRITE) ? &results[i].write :
                                                          &results[i].read;
                 times[i] = point->time;
+                stonewall_time += point->stonewall_time;
+                stonewall_avg_data_accessed += point->stonewall_avg_data_accessed;
         }
 
         bw = bw_values(reps, results, times, access);
@@ -559,9 +566,16 @@ static void PrintLongSummaryOneOperation(IOR_test_t *test, const int access)
           fprintf(out_resultfile, "%10.2f ", ops->mean);
           fprintf(out_resultfile, "%10.2f ", ops->sd);
           fprintf(out_resultfile, "%10.5f ", mean_of_array_of_doubles(times, reps));
+          if(test->params.stoneWallingWearOut){
+            fprintf(out_resultfile, "%10.2f ", stonewall_time / reps);
+            fprintf(out_resultfile, "%13.2f ", stonewall_avg_data_accessed / stonewall_time / MEBIBYTE);
+          }else{
+            fprintf(out_resultfile, "%10s ", "NA");
+            fprintf(out_resultfile, "%13s ", "NA");
+          }
           fprintf(out_resultfile, "%5d ", params->id);
           fprintf(out_resultfile, "%6d ", params->numTasks);
-          fprintf(out_resultfile, "%3d ", params->tasksPerNode);
+          fprintf(out_resultfile, "%3d ", params->numTasksOnNode0);
           fprintf(out_resultfile, "%4d ", params->repetitions);
           fprintf(out_resultfile, "%3d ", params->filePerProc);
           fprintf(out_resultfile, "%5d ", params->reorderTasks);
@@ -585,16 +599,13 @@ static void PrintLongSummaryOneOperation(IOR_test_t *test, const int access)
           PrintKeyValInt("blockSize", params->blockSize);
           PrintKeyValInt("transferSize", params->transferSize);
           PrintKeyValInt("numTasks", params->numTasks);
-          PrintKeyValInt("tasksPerNode", params->tasksPerNode);
+          PrintKeyValInt("tasksPerNode", params->numTasksOnNode0);
           PrintKeyValInt("repetitions", params->repetitions);
           PrintKeyValInt("filePerProc", params->filePerProc);
           PrintKeyValInt("reorderTasks", params->reorderTasks);
           PrintKeyValInt("taskPerNodeOffset", params->taskPerNodeOffset);
           PrintKeyValInt("reorderTasksRandom", params->reorderTasksRandom);
           PrintKeyValInt("reorderTasksRandomSeed", params->reorderTasksRandomSeed);
-          PrintKeyValInt("segmentCount", params->segmentCount);
-          PrintKeyValInt("blockSize", params->blockSize);
-          PrintKeyValInt("transferSize", params->transferSize);
           PrintKeyValDouble("bwMaxMIB", bw->max / MEBIBYTE);
           PrintKeyValDouble("bwMinMIB", bw->min / MEBIBYTE);
           PrintKeyValDouble("bwMeanMIB", bw->mean / MEBIBYTE);
@@ -604,10 +615,12 @@ static void PrintLongSummaryOneOperation(IOR_test_t *test, const int access)
           PrintKeyValDouble("OPsMean", ops->mean);
           PrintKeyValDouble("OPsSD", ops->sd);
           PrintKeyValDouble("MeanTime", mean_of_array_of_doubles(times, reps));
+          if(test->params.stoneWallingWearOut){
+            PrintKeyValDouble("StoneWallTime", stonewall_time / reps);
+            PrintKeyValDouble("StoneWallbwMeanMIB", stonewall_avg_data_accessed / stonewall_time / MEBIBYTE);
+          }
           PrintKeyValDouble("xsizeMiB", (double) point->aggFileSizeForBW / MEBIBYTE);
           PrintEndSection();
-        }else if (outputFormat == OUTPUT_CSV){
-
         }
 
         fflush(out_resultfile);
@@ -629,17 +642,17 @@ void PrintLongSummaryOneTest(IOR_test_t *test)
 
 void PrintLongSummaryHeader()
 {
-        if (rank != 0 || verbose < VERBOSE_0)
+        if (rank != 0 || verbose <= VERBOSE_0)
                 return;
         if(outputFormat != OUTPUT_DEFAULT){
-          return;
+            return;
         }
 
         fprintf(out_resultfile, "\n");
-        fprintf(out_resultfile, "%-9s %10s %10s %10s %10s %10s %10s %10s %10s %10s",
+        fprintf(out_resultfile, "%-9s %10s %10s %10s %10s %10s %10s %10s %10s %10s %10s %13s",
                 "Operation", "Max(MiB)", "Min(MiB)", "Mean(MiB)", "StdDev",
                 "Max(OPs)", "Min(OPs)", "Mean(OPs)", "StdDev",
-                "Mean(s)");
+                "Mean(s)", "Stonewall(s)", "Stonewall(MiB)");
         fprintf(out_resultfile, " Test# #Tasks tPN reps fPP reord reordoff reordrand seed"
                 " segcnt ");
         fprintf(out_resultfile, "%8s %8s %9s %5s", " blksiz", "xsize","aggs(MiB)", "API");
@@ -649,7 +662,7 @@ void PrintLongSummaryHeader()
 void PrintLongSummaryAllTests(IOR_test_t *tests_head)
 {
   IOR_test_t *tptr;
-  if (rank != 0 || verbose < VERBOSE_0)
+  if (rank != 0 || verbose <= VERBOSE_0)
           return;
 
   PrintArrayEnd();
@@ -659,8 +672,6 @@ void PrintLongSummaryAllTests(IOR_test_t *tests_head)
     fprintf(out_resultfile, "Summary of all tests:");
   }else if (outputFormat == OUTPUT_JSON){
     PrintNamedArrayStart("summary");
-  }else if (outputFormat == OUTPUT_CSV){
-
   }
 
   PrintLongSummaryHeader();
@@ -682,7 +693,7 @@ void PrintShortSummary(IOR_test_t * test)
         int reps;
         int i;
 
-        if (rank != 0 || verbose < VERBOSE_0)
+        if (rank != 0 || verbose <= VERBOSE_0)
                 return;
 
         PrintArrayEnd();
@@ -719,45 +730,13 @@ void PrintShortSummary(IOR_test_t * test)
         }
 }
 
-
-/*
- * Display freespace (df).
- */
-void DisplayFreespace(IOR_param_t * test)
-{
-        char fileName[MAX_STR] = { 0 };
-        int i;
-        int directoryFound = FALSE;
-
-        /* get outfile name */
-        GetTestFileName(fileName, test);
-
-        /* get directory for outfile */
-        i = strlen(fileName);
-        while (i-- > 0) {
-                if (fileName[i] == '/') {
-                        fileName[i] = '\0';
-                        directoryFound = TRUE;
-                        break;
-                }
-        }
-
-        /* if no directory/, use '.' */
-        if (directoryFound == FALSE) {
-                strcpy(fileName, ".");
-        }
-
-        ShowFileSystemSize(fileName);
-}
-
-
 void PrintRemoveTiming(double start, double finish, int rep)
 {
-  if (rank != 0 || verbose < VERBOSE_0)
+  if (rank != 0 || verbose <= VERBOSE_0)
     return;
 
   if (outputFormat == OUTPUT_DEFAULT){
-    fprintf(out_resultfile, "remove    -          -          -          -          -          -          ");
+    fprintf(out_resultfile, "remove    -          -          -           -          -          -          -          -          ");
     PPDouble(1, finish-start, " ");
     fprintf(out_resultfile, "%-4d\n", rep);
   }else if (outputFormat == OUTPUT_JSON){

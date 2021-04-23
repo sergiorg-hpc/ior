@@ -1,19 +1,24 @@
-SUBDIRS = .
+SUBDIRS = . test
 
-bin_PROGRAMS = ior mdtest
+bin_PROGRAMS = ior mdtest md-workbench
 if USE_CAPS
-bin_PROGRAMS += IOR MDTEST
+bin_PROGRAMS += IOR MDTEST MD-WORKBENCH
 endif
 
-noinst_HEADERS = ior.h utilities.h parse_options.h aiori.h iordef.h ior-internal.h option.h mdtest.h
+noinst_HEADERS = ior.h utilities.h parse_options.h aiori.h iordef.h ior-internal.h option.h mdtest.h aiori-debug.h aiori-POSIX.h md-workbench.h
 
 lib_LIBRARIES = libaiori.a
-libaiori_a_SOURCES = ior.c mdtest.c utilities.c parse_options.c ior-output.c option.c
+libaiori_a_SOURCES = ior.c mdtest.c utilities.c parse_options.c ior-output.c option.c md-workbench.c
 
 extraSOURCES = aiori.c aiori-DUMMY.c
 extraLDADD =
 extraLDFLAGS =
 extraCPPFLAGS =
+
+md_workbench_SOURCES = md-workbench-main.c
+md_workbench_LDFLAGS =
+md_workbench_LDADD = libaiori.a
+md_workbench_CPPFLAGS =
 
 ior_SOURCES = ior-main.c
 ior_LDFLAGS =
@@ -34,6 +39,14 @@ extraSOURCES  += aiori-HDFS.c
 extraCPPFLAGS += -I/opt/hadoop-2.2.0/include
 extraLDFLAGS  += -L/opt/hadoop-2.2.0/lib/native
 extraLDADD    += -lhdfs
+endif
+
+if HAVE_CUDA
+extraLDADD    += -lcudart
+endif
+
+if HAVE_GPU_DIRECT
+extraLDADD    += -lcufile
 endif
 
 if USE_HDF5_AIORI
@@ -65,13 +78,39 @@ if USE_POSIX_AIORI
 extraSOURCES += aiori-POSIX.c
 endif
 
+if USE_AIO_AIORI
+extraSOURCES += aiori-aio.c
+extraLDADD    += -laio
+endif
+
+if USE_PMDK_AIORI
+extraSOURCES += aiori-PMDK.c
+extraLDADD   += -lpmem
+endif
+
 if USE_RADOS_AIORI
 extraSOURCES += aiori-RADOS.c
 extraLDADD += -lrados
 endif
 
-if USE_S3_AIORI
-extraSOURCES  += aiori-S3.c
+if USE_CEPHFS_AIORI
+extraSOURCES += aiori-CEPHFS.c
+extraLDADD += -lcephfs
+endif
+
+
+if USE_DAOS_AIORI
+extraSOURCES += aiori-DFS.c
+extraLDADD   += -lgurt -ldaos_common -ldaos -ldfs -luuid
+endif
+
+if USE_GFARM_AIORI
+extraSOURCES += aiori-Gfarm.c
+extraLDADD += -lgfarm
+endif
+
+if USE_S3_4C_AIORI
+extraSOURCES  += aiori-S3-4c.c
 if AWS4C_DIR
   extraCPPFLAGS += $(AWS4C_CPPFLAGS)
   extraLDFLAGS  += $(AWS4C_LDFLAGS)
@@ -80,6 +119,16 @@ extraLDADD    += -lcurl
 extraLDADD    += -lxml2
 extraLDADD    += -laws4c
 extraLDADD    += -laws4c_extra
+extraLDADD    += -lcrypto
+endif
+
+if USE_S3_LIBS3_AIORI
+extraSOURCES  += aiori-S3-libs3.c
+extraLDADD    += -ls3
+endif
+
+if WITH_LUSTRE
+extraLDADD  += -llustreapi
 endif
 
 ior_SOURCES  += $(extraSOURCES)
@@ -91,6 +140,16 @@ mdtest_SOURCES  += $(extraSOURCES)
 mdtest_LDFLAGS  += $(extraLDFLAGS)
 mdtest_LDADD    += $(extraLDADD)
 mdtest_CPPFLAGS += $(extraCPPFLAGS)
+
+md_workbench_SOURCES  += $(extraSOURCES)
+md_workbench_LDFLAGS  += $(extraLDFLAGS)
+md_workbench_LDADD    += $(extraLDADD)
+md_workbench_CPPFLAGS += $(extraCPPFLAGS)
+
+MD_WORKBENCH_SOURCES  = $(md_workbench_SOURCES)
+MD_WORKBENCH_LDFLAGS  = $(md_workbench_LDFLAGS)
+MD_WORKBENCH_LDADD    = $(md_workbench_LDADD)
+MD_WORKBENCH_CPPFLAGS = $(md_workbench_CPPFLAGS)
 
 IOR_SOURCES  = $(ior_SOURCES)
 IOR_LDFLAGS  = $(ior_LDFLAGS)
@@ -105,10 +164,9 @@ MDTEST_CPPFLAGS = $(mdtest_CPPFLAGS)
 libaiori_a_SOURCES += $(extraSOURCES)
 libaiori_a_CPPFLAGS = $(extraCPPFLAGS)
 
-
-TESTS = testlib
-bin_PROGRAMS += testlib
-
-testlib_SOURCES  = ./test/lib.c
-testlib_LDFLAGS  = $(extraLDFLAGS)
-testlib_LDADD    = libaiori.a $(extraLDADD)
+# Generate a config file with the build flags to allow the reuse of library
+.PHONY: build.conf
+all-local: build.conf
+build.conf:
+	@echo LDFLAGS=$(LDFLAGS) $(extraLDFLAGS) $(extraLDADD) $(LIBS) > build.conf
+	@echo CFLAGS=$(CFLAGS) $(extraCPPFLAGS) >> build.conf

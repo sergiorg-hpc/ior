@@ -32,42 +32,13 @@
 #include "option.h"
 #include "aiori.h"
 
-#define ISPOWEROFTWO(x) ((x != 0) && !(x & (x - 1)))
+static IOR_param_t initialTestParams;
 
-IOR_param_t initialTestParams;
+option_help * createGlobalOptions(IOR_param_t * params);
 
 
-static size_t NodeMemoryStringToBytes(char *size_str)
-{
-        int percent;
-        int rc;
-        long page_size;
-        long num_pages;
-        long long mem;
-
-        rc = sscanf(size_str, " %d %% ", &percent);
-        if (rc == 0)
-                return (size_t) string_to_bytes(size_str);
-        if (percent > 100 || percent < 0)
-                ERR("percentage must be between 0 and 100");
-
-#ifdef HAVE_SYSCONF
-        page_size = sysconf(_SC_PAGESIZE);
-#else
-        page_size = getpagesize();
-#endif
-
-#ifdef  _SC_PHYS_PAGES
-        num_pages = sysconf(_SC_PHYS_PAGES);
-        if (num_pages == -1)
-                ERR("sysconf(_SC_PHYS_PAGES) is not supported");
-#else
-        ERR("sysconf(_SC_PHYS_PAGES) is not supported");
-#endif
-        mem = page_size * num_pages;
-
-        return mem / 100 * percent;
-}
+static IOR_param_t * parameters;
+static options_all_t * global_options;
 
 
 /*
@@ -90,22 +61,18 @@ static void CheckRunSettings(IOR_test_t *tests)
                         params->writeFile = TRUE;
                 }
 
-                /* If only read or write is requested, then fix the default
-                 * openFlags to not be open RDWR.  It matters in the case
-                 * of HDFS, which doesn't support opening RDWR.
-                 * (We assume int-valued params are exclusively 0 or 1.)
-                 */
-                if ((params->openFlags & IOR_RDWR)
-                    && ((params->readFile | params->checkRead | params->checkWrite)
-                        ^ params->writeFile)) {
+                if(params->dualMount && !params->filePerProc) {
+                  ERR("Dual Mount can only be used with File Per Process");
+                }
 
-                        params->openFlags &= ~(IOR_RDWR);
-                        if (params->readFile | params->checkRead) {
-                                params->openFlags |= IOR_RDONLY;
-                                params->openFlags &= ~(IOR_CREAT|IOR_EXCL);
-                        }
-                        else
-                                params->openFlags |= IOR_WRONLY;
+                if(params->gpuDirect){
+                  if(params->gpuMemoryFlags == IOR_MEMORY_TYPE_GPU_MANAGED){
+                    ERR("GPUDirect cannot be used with managed memory");
+                  }
+                  params->gpuMemoryFlags = IOR_MEMORY_TYPE_GPU_DEVICE_ONLY;
+                  if(params->checkRead || params->checkWrite){
+                    ERR("GPUDirect data cannot yet be checked");
+                  }
                 }
         }
 }
@@ -113,7 +80,7 @@ static void CheckRunSettings(IOR_test_t *tests)
 /*
  * Set flags from commandline string/value pairs.
  */
-void DecodeDirective(char *line, IOR_param_t *params)
+void DecodeDirective(char *line, IOR_param_t *params, options_all_t * module_options)
 {
         char option[MAX_STR];
         char value[MAX_STR];
@@ -132,6 +99,12 @@ void DecodeDirective(char *line, IOR_param_t *params)
         }
         if (strcasecmp(option, "api") == 0) {
           params->api = strdup(value);
+
+          params->backend = aiori_select(params->api);
+          if (params->backend == NULL){
+            fprintf(out_logfile, "Could not load backend API %s\n", params->api);
+            exit(-1);
+          }
         } else if (strcasecmp(option, "summaryFile") == 0) {
           if (rank == 0){
             out_resultfile = fopen(value, "w");
@@ -140,6 +113,21 @@ void DecodeDirective(char *line, IOR_param_t *params)
             }
             printf("Writing output to %s\n", value);
           }
+        } else if (strcasecmp(option, "saveRankPerformanceDetailsCSV") == 0){
+          if (rank == 0){
+            // check that the file is writeable, truncate it and add header
+            FILE* fd = fopen(value, "w");
+            if (fd == NULL){
+              FAIL("Cannot open saveRankPerformanceDetailsCSV file for write!");
+            }
+            char buff[] = "access,rank,runtime-with-openclose,runtime,throughput-withopenclose,throughput\n";
+            int ret = fwrite(buff, strlen(buff), 1, fd);
+            if(ret != 1){
+              FAIL("Cannot write header to saveRankPerformanceDetailsCSV file");
+            }
+            fclose(fd);
+          }
+          params->saveRankDetailsCSV = strdup(value);
         } else if (strcasecmp(option, "summaryFormat") == 0) {
                 if(strcasecmp(value, "default") == 0){
                   outputFormat = OUTPUT_DEFAULT;
@@ -158,8 +146,14 @@ void DecodeDirective(char *line, IOR_param_t *params)
                 params->platform  = strdup(value);
         } else if (strcasecmp(option, "testfile") == 0) {
                 params->testFileName  = strdup(value);
-        } else if (strcasecmp(option, "hintsfilename") == 0) {
-                params->hintsFileName  = strdup(value);
+        } else if (strcasecmp(option, "dualmount") == 0){
+                params->dualMount = atoi(value);
+        } else if (strcasecmp(option, "allocateBufferOnGPU") == 0) {
+                params->gpuMemoryFlags = atoi(value);
+        } else if (strcasecmp(option, "GPUid") == 0) {
+                params->gpuID = atoi(value);
+        } else if (strcasecmp(option, "GPUDirect") == 0) {
+                params->gpuDirect  = atoi(value);
         } else if (strcasecmp(option, "deadlineforstonewalling") == 0) {
                 params->deadlineForStonewalling = atoi(value);
         } else if (strcasecmp(option, "stoneWallingWearOut") == 0) {
@@ -172,8 +166,12 @@ void DecodeDirective(char *line, IOR_param_t *params)
                 params->maxTimeDuration = atoi(value);
         } else if (strcasecmp(option, "outlierthreshold") == 0) {
                 params->outlierThreshold = atoi(value);
-        } else if (strcasecmp(option, "nodes") == 0) {
-                params->nodes = atoi(value);
+        } else if (strcasecmp(option, "numnodes") == 0) {
+                params->numNodes = atoi(value);
+        } else if (strcasecmp(option, "numtasks") == 0) {
+                params->numTasks = atoi(value);
+        } else if (strcasecmp(option, "numtasksonnode0") == 0) {
+                params->numTasksOnNode0 = atoi(value);
         } else if (strcasecmp(option, "repetitions") == 0) {
                 params->repetitions = atoi(value);
         } else if (strcasecmp(option, "intertestdelay") == 0) {
@@ -208,44 +206,24 @@ void DecodeDirective(char *line, IOR_param_t *params)
                 params->keepFileWithError = atoi(value);
         } else if (strcasecmp(option, "multiFile") == 0) {
                 params->multiFile = atoi(value);
-        } else if (strcasecmp(option, "quitonerror") == 0) {
-                params->quitOnError = atoi(value);
+        } else if (strcasecmp(option, "warningAsErrors") == 0) {
+                params->warningAsErrors = atoi(value);
         } else if (strcasecmp(option, "segmentcount") == 0) {
                 params->segmentCount = string_to_bytes(value);
         } else if (strcasecmp(option, "blocksize") == 0) {
                 params->blockSize = string_to_bytes(value);
         } else if (strcasecmp(option, "transfersize") == 0) {
                 params->transferSize = string_to_bytes(value);
-        } else if (strcasecmp(option, "setalignment") == 0) {
-                params->setAlignment = string_to_bytes(value);
         } else if (strcasecmp(option, "singlexferattempt") == 0) {
                 params->singleXferAttempt = atoi(value);
-        } else if (strcasecmp(option, "individualdatasets") == 0) {
-                params->individualDataSets = atoi(value);
         } else if (strcasecmp(option, "intraTestBarriers") == 0) {
                 params->intraTestBarriers = atoi(value);
-        } else if (strcasecmp(option, "nofill") == 0) {
-                params->noFill = atoi(value);
         } else if (strcasecmp(option, "verbose") == 0) {
                 params->verbose = atoi(value);
         } else if (strcasecmp(option, "settimestampsignature") == 0) {
                 params->setTimeStampSignature = atoi(value);
-        } else if (strcasecmp(option, "collective") == 0) {
-                params->collective = atoi(value);
-        } else if (strcasecmp(option, "preallocate") == 0) {
-                params->preallocate = atoi(value);
-        } else if (strcasecmp(option, "storefileoffset") == 0) {
-                params->storeFileOffset = atoi(value);
-        } else if (strcasecmp(option, "usefileview") == 0) {
-                params->useFileView = atoi(value);
-        } else if (strcasecmp(option, "usesharedfilepointer") == 0) {
-                params->useSharedFilePointer = atoi(value);
-        } else if (strcasecmp(option, "useo_direct") == 0) {
-                params->useO_DIRECT = atoi(value);
-        } else if (strcasecmp(option, "usestrideddatatype") == 0) {
-                params->useStridedDatatype = atoi(value);
-        } else if (strcasecmp(option, "showhints") == 0) {
-                params->showHints = atoi(value);
+        } else if (strcasecmp(option, "dataPacketType") == 0) {
+                params->dataPacketType = parsePacketType(value[0]);
         } else if (strcasecmp(option, "uniqueDir") == 0) {
                 params->uniqueDir = atoi(value);
         } else if (strcasecmp(option, "useexistingtestfile") == 0) {
@@ -262,84 +240,60 @@ void DecodeDirective(char *line, IOR_param_t *params)
         } else if (strcasecmp(option, "memoryPerNode") == 0) {
                 params->memoryPerNode = NodeMemoryStringToBytes(value);
                 params->memoryPerTask = 0;
-        } else if (strcasecmp(option, "lustrestripecount") == 0) {
-#ifndef HAVE_LUSTRE_LUSTRE_USER_H
-                ERR("ior was not compiled with Lustre support");
-#endif
-                params->lustre_stripe_count = atoi(value);
-                params->lustre_set_striping = 1;
-        } else if (strcasecmp(option, "lustrestripesize") == 0) {
-#ifndef HAVE_LUSTRE_LUSTRE_USER_H
-                ERR("ior was not compiled with Lustre support");
-#endif
-                params->lustre_stripe_size = string_to_bytes(value);
-                params->lustre_set_striping = 1;
-        } else if (strcasecmp(option, "lustrestartost") == 0) {
-#ifndef HAVE_LUSTRE_LUSTRE_USER_H
-                ERR("ior was not compiled with Lustre support");
-#endif
-                params->lustre_start_ost = atoi(value);
-                params->lustre_set_striping = 1;
-        } else if (strcasecmp(option, "lustreignorelocks") == 0) {
-#ifndef HAVE_LUSTRE_LUSTRE_USER_H
-                ERR("ior was not compiled with Lustre support");
-#endif
-                params->lustre_ignore_locks = atoi(value);
-        } else if (strcasecmp(option, "gpfshintaccess") == 0) {
-#ifndef HAVE_GPFS_FCNTL_H
-                ERR("ior was not compiled with GPFS hint support");
-#endif
-                params->gpfs_hint_access = atoi(value);
-        } else if (strcasecmp(option, "gpfsreleasetoken") == 0) {
-#ifndef HAVE_GPFS_FCNTL_H
-                ERR("ior was not compiled with GPFS hint support");
-#endif
-                params->gpfs_release_token = atoi(value);
-       } else if (strcasecmp(option, "beegfsNumTargets") == 0) {
-#ifndef HAVE_BEEGFS_BEEGFS_H
-                ERR("ior was not compiled with BeeGFS support");
-#endif
-                params->beegfs_numTargets = atoi(value);
-                if (params->beegfs_numTargets < 1)
-                        ERR("beegfsNumTargets must be >= 1");
-        } else if (strcasecmp(option, "beegfsChunkSize") == 0) {
- #ifndef HAVE_BEEGFS_BEEGFS_H
-                 ERR("ior was not compiled with BeeGFS support");
- #endif
-                 params->beegfs_chunkSize = string_to_bytes(value);
-                 if (!ISPOWEROFTWO(params->beegfs_chunkSize) || params->beegfs_chunkSize < (1<<16))
-                         ERR("beegfsChunkSize must be a power of two and >64k");
-        } else if (strcasecmp(option, "numtasks") == 0) {
-                params->numTasks = atoi(value);
         } else if (strcasecmp(option, "summaryalways") == 0) {
                 params->summary_every_test = atoi(value);
         } else {
-                if (rank == 0)
-                        fprintf(out_logfile, "Unrecognized parameter \"%s\"\n",
-                                option);
-                MPI_CHECK(MPI_Initialized(&initialized), "MPI_Initialized() error");
-                if (initialized)
-                    MPI_CHECK(MPI_Abort(MPI_COMM_WORLD, -1), "MPI_Abort() error");
-                else
-                    exit(-1);
+                // backward compatibility for now
+                if (strcasecmp(option, "useo_direct") == 0) {
+                  strcpy(option, "--posix.odirect");
+                }
+                int parsing_error = option_parse_key_value(option, value, module_options);
+                if(parsing_error){
+                  if (rank == 0)
+                          fprintf(out_logfile, "Unrecognized parameter \"%s\"\n",
+                                  option);
+                  MPI_CHECK(MPI_Initialized(&initialized), "MPI_Initialized() error");
+                  if (initialized)
+                      MPI_CHECK(MPI_Abort(MPI_COMM_WORLD, -1), "MPI_Abort() error");
+                  else
+                      exit(-1);
+                }
         }
 }
+
 
 /*
  * Parse a single line, which may contain multiple comma-seperated directives
  */
-void ParseLine(char *line, IOR_param_t * test)
+void ParseLine(char *line, IOR_param_t * test, options_all_t * module_options)
 {
         char *start, *end;
 
-        start = line;
+        char * newline = strdup(line);
+        start = newline;
         do {
+                end = strchr(start, '#');
+                if (end != NULL){
+                  *end = '\0';
+                  end = NULL; // stop parsing after comment
+                }
                 end = strchr(start, ',');
-                if (end != NULL)
-                        *end = '\0';
-                DecodeDirective(start, test);
+                if (end != NULL){
+                  *end = '\0';
+                }
+                if(strlen(start) < 3){
+                  fprintf(out_logfile, "Invalid option substring string: \"%s\" in \"%s\"\n", start, line);
+                  exit(1);
+                }
+                DecodeDirective(start, test, module_options);
                 start = end + 1;
         } while (end != NULL);
+        free(newline);
+}
+
+
+static void decodeDirectiveWrapper(char *line){
+  ParseLine(line, parameters, global_options);
 }
 
 /*
@@ -359,7 +313,7 @@ int contains_only(char *haystack, char *needle)
         /* check for "needle" */
         if (strncasecmp(ptr, needle, strlen(needle)) != 0)
                 return 0;
-        /* make sure the rest of the line is only whitspace as well */
+        /* make sure the rest of the line is only whitespace as well */
         for (ptr += strlen(needle); ptr < end; ptr++) {
                 if (!isspace(*ptr))
                         return 0;
@@ -383,9 +337,12 @@ IOR_test_t *ReadConfigScript(char *scriptName)
         IOR_test_t *head = NULL;
         IOR_test_t *tail = NULL;
 
+        option_help ** option_p = & global_options->modules[0].options;
+
         /* Initialize the first test */
-        head = CreateTest(&initialTestParams, test_num++);
+        head = CreateTest(& initialTestParams, test_num++);
         tail = head;
+        *option_p = createGlobalOptions(& ((IOR_test_t*) head)->params); /* The current options */
 
         /* open the script */
         file = fopen(scriptName, "r");
@@ -422,7 +379,10 @@ IOR_test_t *ReadConfigScript(char *scriptName)
                                    create duplicate test */
                                 tail->next = CreateTest(&tail->params, test_num++);
                                 AllocResults(tail);
+                                ((IOR_test_t*) tail)->params.backend_options = airoi_update_module_options(((IOR_test_t*) tail)->params.backend, global_options);
+
                                 tail = tail->next;
+                                *option_p = createGlobalOptions(& ((IOR_test_t*) tail->next)->params);
                         }
                         runflag = 1;
                 } else if (runflag) {
@@ -430,156 +390,128 @@ IOR_test_t *ReadConfigScript(char *scriptName)
                            create and initialize a new test structure */
                         runflag = 0;
                         tail->next = CreateTest(&tail->params, test_num++);
+                        *option_p = createGlobalOptions(& ((IOR_test_t*) tail->next)->params);
                         AllocResults(tail);
+                        ((IOR_test_t*) tail)->params.backend_options = airoi_update_module_options(((IOR_test_t*) tail)->params.backend, global_options);
+
                         tail = tail->next;
-                        ParseLine(ptr, &tail->params);
+                        ParseLine(ptr, &tail->params, global_options);
                 } else {
-                        ParseLine(ptr, &tail->params);
+                        ParseLine(ptr, &tail->params, global_options);
                 }
         }
 
         /* close the script */
         if (fclose(file) != 0)
                 ERR("fclose() of script file failed");
-        AllocResults(tail);
+        AllocResults(tail);          /* copy the actual module options into the test */
+        ((IOR_test_t*) tail)->params.backend_options = airoi_update_module_options(((IOR_test_t*) tail)->params.backend, global_options);
 
         return head;
 }
 
 
-static IOR_param_t * parameters;
+option_help * createGlobalOptions(IOR_param_t * params){
+  char APIs[1024];
+  char APIs_legacy[1024];
+  aiori_supported_apis(APIs, APIs_legacy, IOR);
+  char * apiStr = safeMalloc(1024);
+  sprintf(apiStr, "API for I/O [%s]", APIs);
 
-static void decodeDirectiveWrapper(char *line){
-  DecodeDirective(line, parameters);
+  option_help o [] = {
+    {'a', NULL,        apiStr, OPTION_OPTIONAL_ARGUMENT, 's', & params->api},
+    {'A', NULL,        "refNum -- user supplied reference number to include in the summary", OPTION_OPTIONAL_ARGUMENT, 'd', & params->referenceNumber},
+    {'b', NULL,        "blockSize -- contiguous bytes to write per task  (e.g.: 8, 4k, 2m, 1g)", OPTION_OPTIONAL_ARGUMENT, 'l', & params->blockSize},
+    {'c', "collective",    "Use collective I/O", OPTION_FLAG, 'd', & params->collective},
+    {'C', NULL,        "reorderTasks -- changes task ordering for readback (useful to avoid client cache)", OPTION_FLAG, 'd', & params->reorderTasks},
+    {'d', NULL,        "interTestDelay -- delay between reps in seconds", OPTION_OPTIONAL_ARGUMENT, 'd', & params->interTestDelay},
+    {'D', NULL,        "deadlineForStonewalling -- seconds before stopping write or read phase", OPTION_OPTIONAL_ARGUMENT, 'd', & params->deadlineForStonewalling},
+    {.help="  -O stoneWallingWearOut=1           -- once the stonewalling timeout is over, all process finish to access the amount of data", .arg = OPTION_OPTIONAL_ARGUMENT},
+    {.help="  -O stoneWallingWearOutIterations=N -- stop after processing this number of iterations, needed for reading data back written with stoneWallingWearOut", .arg = OPTION_OPTIONAL_ARGUMENT},
+    {.help="  -O stoneWallingStatusFile=FILE     -- this file keeps the number of iterations from stonewalling during write and allows to use them for read", .arg = OPTION_OPTIONAL_ARGUMENT},
+#ifdef HAVE_CUDA
+    {.help="  -O allocateBufferOnGPU=X           -- allocate I/O buffers on the GPU: X=1 uses managed memory, X=2 device memory.", .arg = OPTION_OPTIONAL_ARGUMENT},
+    {.help="  -O GPUid=X                         -- select the GPU to use.", .arg = OPTION_OPTIONAL_ARGUMENT},
+#ifdef HAVE_GPU_DIRECT
+    {0, "gpuDirect",        "allocate I/O buffers on the GPU and use gpuDirect to store data; this option is incompatible with any option requiring CPU access to data.", OPTION_FLAG, 'd', & params->gpuDirect},
+#endif
+#endif
+    {'e', NULL,        "fsync -- perform a fsync() operation at the end of each read/write phase", OPTION_FLAG, 'd', & params->fsync},
+    {'E', NULL,        "useExistingTestFile -- do not remove test file before write access", OPTION_FLAG, 'd', & params->useExistingTestFile},
+    {'f', NULL,        "scriptFile -- test script name", OPTION_OPTIONAL_ARGUMENT, 's', & params->testscripts},
+    {'F', NULL,        "filePerProc -- file-per-process", OPTION_FLAG, 'd', & params->filePerProc},
+    {'g', NULL,        "intraTestBarriers -- use barriers between open, write/read, and close", OPTION_FLAG, 'd', & params->intraTestBarriers},
+    /* This option toggles between Incompressible Seed and Time stamp sig based on -l,
+     * so we'll toss the value in both for now, and sort it out in initialization
+     * after all the arguments are in and we know which it keep.
+     */
+    {'G', NULL,        "setTimeStampSignature -- set value for time stamp signature/random seed", OPTION_OPTIONAL_ARGUMENT, 'd', & params->setTimeStampSignature},
+    {'i', NULL,        "repetitions -- number of repetitions of test", OPTION_OPTIONAL_ARGUMENT, 'd', & params->repetitions},
+    {'j', NULL,        "outlierThreshold -- warn on outlier N seconds from mean", OPTION_OPTIONAL_ARGUMENT, 'd', & params->outlierThreshold},
+    {'k', NULL,        "keepFile -- don't remove the test file(s) on program exit", OPTION_FLAG, 'd', & params->keepFile},
+    {'K', NULL,        "keepFileWithError  -- keep error-filled file(s) after data-checking", OPTION_FLAG, 'd', & params->keepFileWithError},
+    {'l', "dataPacketType",        "datapacket type-- type of packet that will be created [offset|incompressible|timestamp|o|i|t]", OPTION_OPTIONAL_ARGUMENT, 's', &  params->buffer_type},
+    {'m', NULL,        "multiFile -- use number of reps (-i) for multiple file count", OPTION_FLAG, 'd', & params->multiFile},
+    {'M', NULL,        "memoryPerNode -- hog memory on the node  (e.g.: 2g, 75%)", OPTION_OPTIONAL_ARGUMENT, 's', & params->memoryPerNodeStr},
+    {'N', NULL,        "numTasks -- number of tasks that are participating in the test (overrides MPI)", OPTION_OPTIONAL_ARGUMENT, 'd', & params->numTasks},
+    {'o', NULL,        "testFile -- full name for test", OPTION_OPTIONAL_ARGUMENT, 's', & params->testFileName},
+    {'O', NULL,        "string of IOR directives (e.g. -O checkRead=1,lustreStripeCount=32)", OPTION_OPTIONAL_ARGUMENT, 'p', & decodeDirectiveWrapper},
+    {'Q', NULL,        "taskPerNodeOffset for read tests use with -C & -Z options (-C constant N, -Z at least N)", OPTION_OPTIONAL_ARGUMENT, 'd', & params->taskPerNodeOffset},
+    {'r', NULL,        "readFile -- read existing file", OPTION_FLAG, 'd', & params->readFile},
+    {'R', NULL,        "checkRead -- verify that the output of read matches the expected signature (used with -G)", OPTION_FLAG, 'd', & params->checkRead},
+    {'s', NULL,        "segmentCount -- number of segments", OPTION_OPTIONAL_ARGUMENT, 'd', & params->segmentCount},
+    {'t', NULL,        "transferSize -- size of transfer in bytes (e.g.: 8, 4k, 2m, 1g)", OPTION_OPTIONAL_ARGUMENT, 'l', & params->transferSize},
+    {'T', NULL,        "maxTimeDuration -- max time in minutes executing repeated test; it aborts only between iterations and not within a test!", OPTION_OPTIONAL_ARGUMENT, 'd', & params->maxTimeDuration},
+    {'u', NULL,        "uniqueDir -- use unique directory name for each file-per-process", OPTION_FLAG, 'd', & params->uniqueDir},
+    {'v', NULL,        "verbose -- output information (repeating flag increases level)", OPTION_FLAG, 'd', & params->verbose},
+    {'w', NULL,        "writeFile -- write file", OPTION_FLAG, 'd', & params->writeFile},
+    {'W', NULL,        "checkWrite -- check read after write", OPTION_FLAG, 'd', & params->checkWrite},
+    {'x', NULL,        "singleXferAttempt -- do not retry transfer if incomplete", OPTION_FLAG, 'd', & params->singleXferAttempt},
+    {'X', NULL,        "reorderTasksRandomSeed -- random seed for -Z option", OPTION_OPTIONAL_ARGUMENT, 'd', & params->reorderTasksRandomSeed},
+    {'y', NULL,        "dualMount -- use dual mount points for a filesystem", OPTION_FLAG, 'd', & params->dualMount},
+    {'Y', NULL,        "fsyncPerWrite -- perform sync operation after every write operation", OPTION_FLAG, 'd', & params->fsyncPerWrite},
+    {'z', NULL,        "randomOffset -- access is to random, not sequential, offsets within a file", OPTION_FLAG, 'd', & params->randomOffset},
+    {0, "randomPrefill", "For random -z access only: Prefill the file with this blocksize, e.g., 2m", OPTION_OPTIONAL_ARGUMENT, 'l', & params->randomPrefillBlocksize},
+    {0, "random-offset-seed",        "The seed for -z", OPTION_OPTIONAL_ARGUMENT, 'd', & params->randomSeed},
+    {'Z', NULL,        "reorderTasksRandom -- changes task ordering to random ordering for readback", OPTION_FLAG, 'd', & params->reorderTasksRandom},
+    {0, "warningAsErrors",        "Any warning should lead to an error.", OPTION_FLAG, 'd', & params->warningAsErrors},
+    {.help="  -O summaryFile=FILE                 -- store result data into this file", .arg = OPTION_OPTIONAL_ARGUMENT},
+    {.help="  -O summaryFormat=[default,JSON,CSV] -- use the format for outputting the summary", .arg = OPTION_OPTIONAL_ARGUMENT},
+    {.help="  -O saveRankPerformanceDetailsCSV=<FILE> -- store the performance of each rank into the named CSV file.", .arg = OPTION_OPTIONAL_ARGUMENT},
+    {0, "dryRun",      "do not perform any I/Os just run evtl. inputs print dummy output", OPTION_FLAG, 'd', & params->dryRun},
+    LAST_OPTION,
+  };
+  option_help * options = malloc(sizeof(o));
+  memcpy(options, & o, sizeof(o));
+  return options;
 }
+
 
 /*
  * Parse Commandline.
  */
-IOR_test_t *ParseCommandLine(int argc, char **argv)
+IOR_test_t *ParseCommandLine(int argc, char **argv, MPI_Comm com)
 {
-    char * testscripts = NULL;
-    int toggleG = FALSE;
-    char * buffer_type = "";
-    char * memoryPerNode = NULL;
-    init_IOR_Param_t(& initialTestParams);
+    init_IOR_Param_t(& initialTestParams, com);
+
+    IOR_test_t *tests = NULL;
+
+    initialTestParams.platform = GetPlatformName();
+
+    option_help * options = createGlobalOptions( & initialTestParams);
     parameters = & initialTestParams;
+    global_options = airoi_create_all_module_options(options);
+    option_parse(argc, argv, global_options);
+    updateParsedOptions(& initialTestParams, global_options);
 
-    char APIs[1024];
-    char APIs_legacy[1024];
-    aiori_supported_apis(APIs, APIs_legacy, IOR);
-    char apiStr[1024];
-    sprintf(apiStr, "API for I/O [%s]", APIs);
+    if (initialTestParams.testscripts){
+      tests = ReadConfigScript(initialTestParams.testscripts);
+    }else{
+      tests = CreateTest(&initialTestParams, 0);
+      AllocResults(tests);
+    }
 
-    option_help options [] = {
-          {'a', NULL,        apiStr, OPTION_OPTIONAL_ARGUMENT, 's', & initialTestParams.api},
-          {'A', NULL,        "refNum -- user supplied reference number to include in the summary", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.referenceNumber},
-          {'b', NULL,        "blockSize -- contiguous bytes to write per task  (e.g.: 8, 4k, 2m, 1g)", OPTION_OPTIONAL_ARGUMENT, 'l', & initialTestParams.blockSize},
-          {'B', NULL,        "useO_DIRECT -- uses O_DIRECT for POSIX, bypassing I/O buffers", OPTION_FLAG, 'd', & initialTestParams.useO_DIRECT},
-          {'c', NULL,        "collective -- collective I/O", OPTION_FLAG, 'd', & initialTestParams.collective},
-          {'C', NULL,        "reorderTasks -- changes task ordering to n+1 ordering for readback", OPTION_FLAG, 'd', & initialTestParams.reorderTasks},
-          {'d', NULL,        "interTestDelay -- delay between reps in seconds", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.interTestDelay},
-          {'D', NULL,        "deadlineForStonewalling -- seconds before stopping write or read phase", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.deadlineForStonewalling},
-          {.help="  -O stoneWallingWearOut=1           -- once the stonewalling timout is over, all process finish to access the amount of data", .arg = OPTION_OPTIONAL_ARGUMENT},
-          {.help="  -O stoneWallingWearOutIterations=N -- stop after processing this number of iterations, needed for reading data back written with stoneWallingWearOut", .arg = OPTION_OPTIONAL_ARGUMENT},
-          {.help="  -O stoneWallingStatusFile=FILE     -- this file keeps the number of iterations from stonewalling during write and allows to use them for read", .arg = OPTION_OPTIONAL_ARGUMENT},
-          {'e', NULL,        "fsync -- perform sync operation after each block write", OPTION_FLAG, 'd', & initialTestParams.fsync},
-          {'E', NULL,        "useExistingTestFile -- do not remove test file before write access", OPTION_FLAG, 'd', & initialTestParams.useExistingTestFile},
-          {'f', NULL,        "scriptFile -- test script name", OPTION_OPTIONAL_ARGUMENT, 's', & testscripts},
-          {'F', NULL,        "filePerProc -- file-per-process", OPTION_FLAG, 'd', & initialTestParams.filePerProc},
-          {'g', NULL,        "intraTestBarriers -- use barriers between open, write/read, and close", OPTION_FLAG, 'd', & initialTestParams.intraTestBarriers},
-          /* This option toggles between Incompressible Seed and Time stamp sig based on -l,
-           * so we'll toss the value in both for now, and sort it out in initialization
-           * after all the arguments are in and we know which it keep.
-           */
-          {'G', NULL,        "setTimeStampSignature -- set value for time stamp signature/random seed", OPTION_OPTIONAL_ARGUMENT, 'd', & toggleG},
-          {'H', NULL,        "showHints -- show hints", OPTION_FLAG, 'd', & initialTestParams.showHints},
-          {'i', NULL,        "repetitions -- number of repetitions of test", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.repetitions},
-          {'I', NULL,        "individualDataSets -- datasets not shared by all procs [not working]", OPTION_FLAG, 'd', & initialTestParams.individualDataSets},
-          {'j', NULL,        "outlierThreshold -- warn on outlier N seconds from mean", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.outlierThreshold},
-          {'J', NULL,        "setAlignment -- HDF5 alignment in bytes (e.g.: 8, 4k, 2m, 1g)", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.setAlignment},
-          {'k', NULL,        "keepFile -- don't remove the test file(s) on program exit", OPTION_FLAG, 'd', & initialTestParams.keepFile},
-          {'K', NULL,        "keepFileWithError  -- keep error-filled file(s) after data-checking", OPTION_FLAG, 'd', & initialTestParams.keepFileWithError},
-          {'l', NULL,        "datapacket type-- type of packet that will be created [offset|incompressible|timestamp|o|i|t]", OPTION_OPTIONAL_ARGUMENT, 's', & buffer_type},
-          {'m', NULL,        "multiFile -- use number of reps (-i) for multiple file count", OPTION_FLAG, 'd', & initialTestParams.multiFile},
-          {'M', NULL,        "memoryPerNode -- hog memory on the node  (e.g.: 2g, 75%)", OPTION_OPTIONAL_ARGUMENT, 's', & memoryPerNode},
-          {'n', NULL,        "noFill -- no fill in HDF5 file creation", OPTION_FLAG, 'd', & initialTestParams.noFill},
-          {'N', NULL,        "numTasks -- number of tasks that should participate in the test", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.numTasks},
-          {'o', NULL,        "testFile -- full name for test", OPTION_OPTIONAL_ARGUMENT, 's', & initialTestParams.testFileName},
-          {'O', NULL,        "string of IOR directives (e.g. -O checkRead=1,lustreStripeCount=32)", OPTION_OPTIONAL_ARGUMENT, 'p', & decodeDirectiveWrapper},
-          {'p', NULL,        "preallocate -- preallocate file size", OPTION_FLAG, 'd', & initialTestParams.preallocate},
-          {'P', NULL,        "useSharedFilePointer -- use shared file pointer [not working]", OPTION_FLAG, 'd', & initialTestParams.useSharedFilePointer},
-          {'q', NULL,        "quitOnError -- during file error-checking, abort on error", OPTION_FLAG, 'd', & initialTestParams.quitOnError},
-          {'Q', NULL,        "taskPerNodeOffset for read tests use with -C & -Z options (-C constant N, -Z at least N)", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.taskPerNodeOffset},
-          {'r', NULL,        "readFile -- read existing file", OPTION_FLAG, 'd', & initialTestParams.readFile},
-          {'R', NULL,        "checkRead -- verify that the output of read matches the expected signature (used with -G)", OPTION_FLAG, 'd', & initialTestParams.checkRead},
-          {'s', NULL,        "segmentCount -- number of segments", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.segmentCount},
-          {'S', NULL,        "useStridedDatatype -- put strided access into datatype [not working]", OPTION_FLAG, 'd', & initialTestParams.useStridedDatatype},
-          {'t', NULL,        "transferSize -- size of transfer in bytes (e.g.: 8, 4k, 2m, 1g)", OPTION_OPTIONAL_ARGUMENT, 'l', & initialTestParams.transferSize},
-          {'T', NULL,        "maxTimeDuration -- max time in minutes executing repeated test; it aborts only between iterations and not within a test!", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.maxTimeDuration},
-          {'u', NULL,        "uniqueDir -- use unique directory name for each file-per-process", OPTION_FLAG, 'd', & initialTestParams.uniqueDir},
-          {'U', NULL,        "hintsFileName -- full name for hints file", OPTION_OPTIONAL_ARGUMENT, 's', & initialTestParams.hintsFileName},
-          {'v', NULL,        "verbose -- output information (repeating flag increases level)", OPTION_FLAG, 'd', & initialTestParams.verbose},
-          {'V', NULL,        "useFileView -- use MPI_File_set_view", OPTION_FLAG, 'd', & initialTestParams.useFileView},
-          {'w', NULL,        "writeFile -- write file", OPTION_FLAG, 'd', & initialTestParams.writeFile},
-          {'W', NULL,        "checkWrite -- check read after write", OPTION_FLAG, 'd', & initialTestParams.checkWrite},
-          {'x', NULL,        "singleXferAttempt -- do not retry transfer if incomplete", OPTION_FLAG, 'd', & initialTestParams.singleXferAttempt},
-          {'X', NULL,        "reorderTasksRandomSeed -- random seed for -Z option", OPTION_OPTIONAL_ARGUMENT, 'd', & initialTestParams.reorderTasksRandomSeed},
-          {'Y', NULL,        "fsyncPerWrite -- perform sync operation after every write operation", OPTION_FLAG, 'd', & initialTestParams.fsyncPerWrite},
-          {'z', NULL,        "randomOffset -- access is to random, not sequential, offsets within a file", OPTION_FLAG, 'd', & initialTestParams.randomOffset},
-          {'Z', NULL,        "reorderTasksRandom -- changes task ordering to random ordering for readback", OPTION_FLAG, 'd', & initialTestParams.reorderTasksRandom},
-          {.help="  -O summaryFile=FILE                 -- store result data into this file", .arg = OPTION_OPTIONAL_ARGUMENT},
-          {.help="  -O summaryFormat=[default,JSON,CSV] -- use the format for outputing the summary", .arg = OPTION_OPTIONAL_ARGUMENT},
-          {0, "dryRun",      "do not perform any I/Os just run evtl. inputs print dummy output", OPTION_FLAG, 'd', & initialTestParams.dryRun},
-          LAST_OPTION,
-        };
+    CheckRunSettings(tests);
 
-        IOR_test_t *tests = NULL;
-
-        GetPlatformName(initialTestParams.platform);
-        airoi_parse_options(argc, argv, options);
-
-        if (toggleG){
-          initialTestParams.setTimeStampSignature = toggleG;
-          initialTestParams.incompressibleSeed = toggleG;
-        }
-
-        if (buffer_type[0] != 0){
-          switch(buffer_type[0]) {
-          case 'i': /* Incompressible */
-                  initialTestParams.dataPacketType = incompressible;
-                  break;
-          case 't': /* timestamp */
-                  initialTestParams.dataPacketType = timestamp;
-                  break;
-          case 'o': /* offset packet */
-                  initialTestParams.storeFileOffset = TRUE;
-                  initialTestParams.dataPacketType = offset;
-                  break;
-          default:
-                  fprintf(out_logfile,
-                          "Unknown arguement for -l %s; generic assumed\n", buffer_type);
-                  break;
-          }
-        }
-        if (memoryPerNode){
-          initialTestParams.memoryPerNode = NodeMemoryStringToBytes(memoryPerNode);
-        }
-        const ior_aiori_t * backend = aiori_select(initialTestParams.api);
-        if (backend == NULL)
-            ERR_SIMPLE("unrecognized I/O API");
-
-        initialTestParams.backend = backend;
-        initialTestParams.apiVersion = backend->get_version();
-
-        if (testscripts){
-          tests = ReadConfigScript(testscripts);
-        }else{
-          tests = CreateTest(&initialTestParams, 0);
-          AllocResults(tests);
-        }
-
-        CheckRunSettings(tests);
-
-        return (tests);
+    return (tests);
 }

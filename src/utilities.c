@@ -16,10 +16,17 @@
 #  include "config.h"
 #endif
 
+#ifdef HAVE_GETCPU_SYSCALL
+#  define _GNU_SOURCE
+#  include <unistd.h>
+#  include <sys/syscall.h>
+#endif
+
 #ifdef __linux__
 #  define _GNU_SOURCE            /* Needed for O_DIRECT in fcntl */
 #endif                           /* __linux__ */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -29,6 +36,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+
+#ifdef HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #ifndef _WIN32
 #  include <regex.h>
@@ -46,31 +57,192 @@
 #include "utilities.h"
 #include "aiori.h"
 #include "ior.h"
+#include "ior-internal.h"
 
 /************************** D E C L A R A T I O N S ***************************/
 
 extern int errno;
 extern int numTasks;
 
-/* globals used by other files, also defined "extern" in ior.h */
-int      numTasksWorld = 0;
+/* globals used by other files, also defined "extern" in utilities.h */
 int      rank = 0;
 int      rankOffset = 0;
-int      tasksPerNode = 0;           /* tasks per node */
 int      verbose = VERBOSE_0;        /* verbose output */
 MPI_Comm testComm;
-MPI_Comm mpi_comm_world;
-FILE * out_logfile;
-FILE * out_resultfile;
+FILE * out_logfile = NULL;
+FILE * out_resultfile = NULL;
 enum OutputFormat_t outputFormat;
 
 /***************************** F U N C T I O N S ******************************/
 
+void update_write_memory_pattern(uint64_t item, char * buf, size_t bytes, int rand_seed, int pretendRank, ior_dataPacketType_e dataPacketType){
+  if(dataPacketType == DATA_TIMESTAMP || bytes < 8) return;
+  int k=1;
+  uint64_t * buffi = (uint64_t*) buf;
+  for(size_t i=0; i < bytes/sizeof(uint64_t); i+=512, k++){
+    buffi[i] = ((uint32_t) item * k) | ((uint64_t) pretendRank) << 32;
+  }
+}
+
+void generate_memory_pattern(char * buf, size_t bytes, int rand_seed, int pretendRank, ior_dataPacketType_e dataPacketType){
+  uint64_t * buffi = (uint64_t*) buf;
+  // first half of 64 bits use the rank
+  const size_t size = bytes / 8;
+  // the first 8 bytes of each 4k block are updated at runtime
+  unsigned seed = rand_seed + pretendRank;
+  for(size_t i=0; i < size; i++){
+    switch(dataPacketType){
+      case(DATA_INCOMPRESSIBLE):{
+        uint64_t hi = ((uint64_t) rand_r(& seed) << 32);
+        uint64_t lo = (uint64_t) rand_r(& seed);
+        buffi[i] = hi | lo;
+        break;
+      }case(DATA_OFFSET):{
+      }case(DATA_TIMESTAMP):{
+        buffi[i] = ((uint64_t) pretendRank) << 32 | rand_seed + i;
+        break;
+      }
+    }
+  }
+  
+  for(size_t i=size*8; i < bytes; i++){
+    buf[i] = (char) i;
+  }
+}
+
+int verify_memory_pattern(uint64_t item, char * buffer, size_t bytes, int rand_seed, int pretendRank, ior_dataPacketType_e dataPacketType){
+  int error = 0;
+  // always read all data to ensure that performance numbers stay the same
+  uint64_t * buffi = (uint64_t*) buffer;
+  
+  // the first 8 bytes are set to item number
+  int k=1;  
+  unsigned seed = rand_seed + pretendRank;
+  const size_t size = bytes / 8;
+  for(size_t i=0; i < size; i++){
+    uint64_t exp;
+        
+    switch(dataPacketType){
+      case(DATA_INCOMPRESSIBLE):{
+        uint64_t hi = ((uint64_t) rand_r(& seed) << 32);
+        uint64_t lo = (uint64_t) rand_r(& seed);
+        exp = hi | lo;
+        break;
+      }case(DATA_OFFSET):{
+      }case(DATA_TIMESTAMP):{
+        exp = ((uint64_t) pretendRank) << 32 | rand_seed + i;
+        break;
+      }
+    }
+    if(i % 512 == 0 && dataPacketType != DATA_TIMESTAMP){
+      exp = ((uint32_t) item * k) | ((uint64_t) pretendRank) << 32;
+      k++;
+    }
+    if(buffi[i] != exp){
+      error = 1;
+    }
+  }
+  for(size_t i=size*8; i < bytes; i++){
+    if(buffer[i] != (char) i){
+      error = 1;
+    }
+  }
+  return error;
+}
+
+void* safeMalloc(uint64_t size){
+  void * d = malloc(size);
+  if (d == NULL){
+    ERR("Could not malloc an array");
+  }
+  memset(d, 0, size);
+  return d;
+}
+
+void FailMessage(int rank, const char *location, char *format, ...) {
+    char msg[4096];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(msg, 4096, format, args);
+    va_end(args);
+    fprintf(out_logfile, "%s: Process %d: FAILED in %s, %s\n",
+                PrintTimestamp(), rank, location, msg);
+    fflush(out_logfile);
+    MPI_Abort(testComm, 1);
+}
+
+size_t NodeMemoryStringToBytes(char *size_str)
+{
+        int percent;
+        int rc;
+        long page_size;
+        long num_pages;
+        long long mem;
+
+        rc = sscanf(size_str, " %d %% ", &percent);
+        if (rc == 0)
+                return (size_t) string_to_bytes(size_str);
+        if (percent > 100 || percent < 0)
+                ERR("percentage must be between 0 and 100");
+
+#ifdef HAVE_SYSCONF
+        page_size = sysconf(_SC_PAGESIZE);
+#else
+        page_size = getpagesize();
+#endif
+
+#ifdef  _SC_PHYS_PAGES
+        num_pages = sysconf(_SC_PHYS_PAGES);
+        if (num_pages == -1)
+                ERR("sysconf(_SC_PHYS_PAGES) is not supported");
+#else
+        ERR("sysconf(_SC_PHYS_PAGES) is not supported");
+#endif
+        mem = page_size * num_pages;
+
+        return mem / 100 * percent;
+}
+
+ior_dataPacketType_e parsePacketType(char t){
+    switch(t) {
+    case '\0': return DATA_TIMESTAMP;
+    case 'i': /* Incompressible */
+            return DATA_INCOMPRESSIBLE;
+    case 't': /* timestamp */
+            return DATA_TIMESTAMP;
+    case 'o': /* offset packet */
+            return DATA_OFFSET;
+    default:
+      ERRF("Unknown packet type \"%c\"; generic assumed\n", t);
+      return DATA_OFFSET;
+    }
+}
+
+void updateParsedOptions(IOR_param_t * options, options_all_t * global_options){
+    if (options->setTimeStampSignature){
+      options->incompressibleSeed = options->setTimeStampSignature;
+    }
+
+    if (options->buffer_type && options->buffer_type[0] != 0){
+      options->dataPacketType = parsePacketType(options->buffer_type[0]);
+    }
+    if (options->memoryPerNodeStr){
+      options->memoryPerNode = NodeMemoryStringToBytes(options->memoryPerNodeStr);
+    }
+    const ior_aiori_t * backend = aiori_select(options->api);
+    if (backend == NULL)
+        ERR("Unrecognized I/O API");
+
+    options->backend = backend;
+    /* copy the actual module options into the test */
+    options->backend_options = airoi_update_module_options(backend, global_options);
+    options->apiVersion = backend->get_version();
+}
 
 /* Used in aiori-POSIX.c and aiori-PLFS.c
  */
 
-void set_o_direct_flag(int *fd)
+void set_o_direct_flag(int *flag)
 {
 /* note that TRU64 needs O_DIRECTIO, SunOS uses directio(),
    and everyone else needs O_DIRECT */
@@ -83,7 +255,7 @@ void set_o_direct_flag(int *fd)
 #  endif                          /* not O_DIRECTIO */
 #endif                            /* not O_DIRECT */
 
-        *fd |= O_DIRECT;
+        *flag |= O_DIRECT;
 }
 
 
@@ -136,46 +308,169 @@ void DumpBuffer(void *buffer,
         return;
 }                               /* DumpBuffer() */
 
-#if MPI_VERSION >= 3
-int CountTasksPerNode(MPI_Comm comm) {
-    /* modern MPI provides a simple way to get the local process count */
-    MPI_Comm shared_comm;
-    int count;
+/* a function that prints an int array where each index corresponds to a rank
+   and the value is whether that rank is on the same host as root.
+   Also returns 1 if rank 1 is on same host and 0 otherwise
+*/
+int QueryNodeMapping(MPI_Comm comm, int print_nodemap) {
+    char localhost[MAX_PATHLEN], roothost[MAX_PATHLEN];
+    int num_ranks;
+    MPI_Comm_size(comm, &num_ranks);
+    int *node_map = (int*)malloc(sizeof(int) * num_ranks);
+    if ( ! node_map ) {
+        FAIL("malloc");
+    }
+    if (gethostname(localhost, MAX_PATHLEN) != 0) {
+        FAIL("gethostname()");
+    }
+    if (rank==0) {
+        strncpy(roothost,localhost,MAX_PATHLEN);
+    }
 
-    MPI_Comm_split_type (comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &shared_comm);
-    MPI_Comm_size (shared_comm, &count);
-    MPI_Comm_free (&shared_comm);
-
-    return count;
+    /* have rank 0 broadcast out its hostname */
+    MPI_Bcast(roothost, MAX_PATHLEN, MPI_CHAR, 0, comm);
+    //printf("Rank %d received root host as %s\n", rank, roothost);
+    /* then every rank figures out whether it is same host as root and then gathers that */
+    int same_as_root = strcmp(roothost,localhost) == 0;
+    MPI_Gather( &same_as_root, 1, MPI_INT, node_map, 1, MPI_INT, 0, comm);
+    if ( print_nodemap && rank==0) {
+        fprintf( out_logfile, "Nodemap: " );
+        for ( int i = 0; i < num_ranks; i++ ) {
+            fprintf( out_logfile, "%d", node_map[i] );
+        }
+        fprintf( out_logfile, "\n" );
+    }
+    int ret = 1;
+    if(num_ranks>1)
+        ret = node_map[1] == 1;
+    MPI_Bcast(&ret, 1, MPI_INT, 0, comm);
+    free(node_map);
+    return ret;
 }
+
+/*
+ * There is a more direct way to determine the node count in modern MPI
+ * versions so we use that if possible.
+ *
+ * For older versions we use a method which should still provide accurate
+ * results even if the total number of tasks is not evenly divisible by the
+ * tasks on node rank 0.
+ */
+int GetNumNodes(MPI_Comm comm) {
+    if (getenv("IOR_FAKE_NODES")){
+      int numNodes = atoi(getenv("IOR_FAKE_NODES"));
+      int rank;
+      MPI_Comm_rank(comm, & rank);
+      if(rank == 0){
+        printf("Fake number of node: using %d\n", numNodes);
+      }
+      return numNodes;
+    }
+#if MPI_VERSION >= 3
+        MPI_Comm shared_comm;
+        int shared_rank = 0;
+        int local_result = 0;
+        int numNodes = 0;
+
+        MPI_CHECK(MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &shared_comm),
+                  "MPI_Comm_split_type() error");
+        MPI_CHECK(MPI_Comm_rank(shared_comm, &shared_rank), "MPI_Comm_rank() error");
+        local_result = shared_rank == 0? 1 : 0;
+        MPI_CHECK(MPI_Allreduce(&local_result, &numNodes, 1, MPI_INT, MPI_SUM, comm),
+                  "MPI_Allreduce() error");
+        MPI_CHECK(MPI_Comm_free(&shared_comm), "MPI_Comm_free() error");
+
+        return numNodes;
+#else
+        int numTasks = 0;
+        int numTasksOnNode0 = 0;
+
+        numTasks = GetNumTasks(comm);
+        numTasksOnNode0 = GetNumTasksOnNode0(comm);
+
+        return ((numTasks - 1) / numTasksOnNode0) + 1;
+#endif
+}
+
+
+int GetNumTasks(MPI_Comm comm) {
+        int numTasks = 0;
+
+        MPI_CHECK(MPI_Comm_size(comm, &numTasks), "cannot get number of tasks");
+
+        return numTasks;
+}
+
+
+/*
+ * It's very important that this method provide the same result to every
+ * process as it's used for redistributing which jobs read from which files.
+ * It was renamed accordingly.
+ *
+ * If different nodes get different results from this method then jobs get
+ * redistributed unevenly and you no longer have a 1:1 relationship with some
+ * nodes reading multiple files while others read none.
+ *
+ * In the common case the number of tasks on each node (MPI_Comm_size on an
+ * MPI_COMM_TYPE_SHARED communicator) will be the same.  However, there is
+ * nothing which guarantees this.  It's valid to have, for example, 64 jobs
+ * across 4 systems which can run 20 jobs each.  In that scenario you end up
+ * with 3 MPI_COMM_TYPE_SHARED groups of 20, and one group of 4.
+ *
+ * In the (MPI_VERSION < 3) implementation of this method consistency is
+ * ensured by asking specifically about the number of tasks on the node with
+ * rank 0.  In the original implementation for (MPI_VERSION >= 3) this was
+ * broken by using the LOCAL process count which differed depending on which
+ * node you were on.
+ *
+ * This was corrected below by first splitting the comm into groups by node
+ * (MPI_COMM_TYPE_SHARED) and then having only the node with world rank 0 and
+ * shared rank 0 return the MPI_Comm_size of its shared subgroup. This yields
+ * the original consistent behavior no matter which node asks.
+ *
+ * In the common case where every node has the same number of tasks this
+ * method will return the same value it always has.
+ */
+int GetNumTasksOnNode0(MPI_Comm comm) {
+  if (getenv("IOR_FAKE_TASK_PER_NODES")){
+    int tasksPerNode = atoi(getenv("IOR_FAKE_TASK_PER_NODES"));
+    int rank;
+    MPI_Comm_rank(comm, & rank);
+    if(rank == 0){
+      printf("Fake tasks per node: using %d\n", tasksPerNode);
+    }
+    return tasksPerNode;
+  }
+#if MPI_VERSION >= 3
+        MPI_Comm shared_comm;
+        int shared_rank = 0;
+        int tasks_on_node_rank0 = 0;
+        int local_result = 0;
+
+        MPI_CHECK(MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &shared_comm),
+                  "MPI_Comm_split_type() error");
+        MPI_CHECK(MPI_Comm_rank(shared_comm, &shared_rank), "MPI_Comm_rank() error");
+        if (rank == 0 && shared_rank == 0) {
+                MPI_CHECK(MPI_Comm_size(shared_comm, &local_result), "MPI_Comm_size() error");
+        }
+        MPI_CHECK(MPI_Allreduce(&local_result, &tasks_on_node_rank0, 1, MPI_INT, MPI_SUM, comm),
+                  "MPI_Allreduce() error");
+        MPI_CHECK(MPI_Comm_free(&shared_comm), "MPI_Comm_free() error");
+
+        return tasks_on_node_rank0;
 #else
 /*
- * Count the number of tasks that share a host.
- *
- * This function employees the gethostname() call, rather than using
+ * This version employs the gethostname() call, rather than using
  * MPI_Get_processor_name().  We are interested in knowing the number
  * of tasks that share a file system client (I/O node, compute node,
  * whatever that may be).  However on machines like BlueGene/Q,
  * MPI_Get_processor_name() uniquely identifies a cpu in a compute node,
  * not the node where the I/O is function shipped to.  gethostname()
  * is assumed to identify the shared filesystem client in more situations.
- *
- * NOTE: This also assumes that the task count on all nodes is equal
- * to the task count on the host running MPI task 0.
  */
-int CountTasksPerNode(MPI_Comm comm) {
     int size;
     MPI_Comm_size(comm, & size);
     /* for debugging and testing */
-    if (getenv("IOR_FAKE_TASK_PER_NODES")){
-      int tasksPerNode = atoi(getenv("IOR_FAKE_TASK_PER_NODES"));
-      int rank;
-      MPI_Comm_rank(comm, & rank);
-      if(rank == 0){
-        printf("Fake tasks per node: using %d\n", tasksPerNode);
-      }
-      return tasksPerNode;
-    }
     char       localhost[MAX_PATHLEN],
         hostname[MAX_PATHLEN];
     int        count               = 1,
@@ -206,8 +501,8 @@ int CountTasksPerNode(MPI_Comm comm) {
     MPI_Bcast(&count, 1, MPI_INT, 0, comm);
 
     return(count);
-}
 #endif
+}
 
 
 /*
@@ -215,21 +510,23 @@ int CountTasksPerNode(MPI_Comm comm) {
  */
 void ExtractHint(char *settingVal, char *valueVal, char *hintString)
 {
-        char *settingPtr, *valuePtr, *tmpPtr1, *tmpPtr2;
+        char *settingPtr, *valuePtr, *tmpPtr2;
 
+        /* find the value */
         settingPtr = (char *)strtok(hintString, " =");
         valuePtr = (char *)strtok(NULL, " =\t\r\n");
-        tmpPtr1 = settingPtr;
-        tmpPtr2 = (char *)strstr(settingPtr, "IOR_HINT__MPI__");
-        if (tmpPtr1 == tmpPtr2) {
+        /* is this an MPI hint? */
+        tmpPtr2 = (char *) strstr(settingPtr, "IOR_HINT__MPI__");
+        if (settingPtr == tmpPtr2) {
                 settingPtr += strlen("IOR_HINT__MPI__");
-
         } else {
-                tmpPtr2 = (char *)strstr(settingPtr, "IOR_HINT__GPFS__");
-                if (tmpPtr1 == tmpPtr2) {
-                        settingPtr += strlen("IOR_HINT__GPFS__");
-                        fprintf(out_logfile,
-                                "WARNING: Unable to set GPFS hints (not implemented.)\n");
+                tmpPtr2 = (char *) strstr(hintString, "IOR_HINT__GPFS__");
+                /* is it an GPFS hint? */
+                if (settingPtr == tmpPtr2) {
+                  settingPtr += strlen("IOR_HINT__GPFS__");
+                }else{
+                  fprintf(out_logfile, "WARNING: Unable to set unknown hint type (not implemented.)\n");
+                  return;
                 }
         }
         strcpy(settingVal, settingPtr);
@@ -353,88 +650,64 @@ IOR_offset_t StringToBytes(char *size_str)
 /*
  * Displays size of file system and percent of data blocks and inodes used.
  */
-void ShowFileSystemSize(char *fileSystem)
+void ShowFileSystemSize(char * filename, const struct ior_aiori * backend, void * backend_options) // this might be converted to an AIORI call
 {
-#ifndef _WIN32                  /* FIXME */
-        char realPath[PATH_MAX];
-        char *fileSystemUnitStr;
-        long long int totalFileSystemSize;
-        long long int freeFileSystemSize;
-        long long int totalInodes;
-        long long int freeInodes;
-        double totalFileSystemSizeHR;
-        double usedFileSystemPercentage;
-        double usedInodePercentage;
-#ifdef __sun                    /* SunOS does not support statfs(), instead uses statvfs() */
-        struct statvfs statusBuffer;
-#else                           /* !__sun */
-        struct statfs statusBuffer;
-#endif                          /* __sun */
+  ior_aiori_statfs_t stat;
+  if(! backend->statfs){
+    WARN("Backend doesn't implement statfs");
+    return;
+  }
+  int ret = backend->statfs(filename, & stat, backend_options);
+  if( ret != 0 ){
+    WARN("Backend returned error during statfs");
+    return;
+  }
+  long long int totalFileSystemSize;
+  long long int freeFileSystemSize;
+  long long int totalInodes;
+  long long int freeInodes;
+  double totalFileSystemSizeHR;
+  double usedFileSystemPercentage;
+  double usedInodePercentage;
+  char *fileSystemUnitStr;
 
-#ifdef __sun
-        if (statvfs(fileSystem, &statusBuffer) != 0) {
-                ERR("unable to statvfs() file system");
-        }
-#else                           /* !__sun */
-        if (statfs(fileSystem, &statusBuffer) != 0) {
-                ERR("unable to statfs() file system");
-        }
-#endif                          /* __sun */
+  totalFileSystemSize = stat.f_blocks * stat.f_bsize;
+  freeFileSystemSize = stat.f_bfree * stat.f_bsize;
+  usedFileSystemPercentage = (1 - ((double)freeFileSystemSize / (double)totalFileSystemSize)) * 100;
+  totalFileSystemSizeHR = (double)totalFileSystemSize / (double)(1<<30);
 
-        /* data blocks */
-#ifdef __sun
-        totalFileSystemSize = statusBuffer.f_blocks * statusBuffer.f_frsize;
-        freeFileSystemSize = statusBuffer.f_bfree * statusBuffer.f_frsize;
-#else                           /* !__sun */
-        totalFileSystemSize = statusBuffer.f_blocks * statusBuffer.f_bsize;
-        freeFileSystemSize = statusBuffer.f_bfree * statusBuffer.f_bsize;
-#endif                          /* __sun */
+  /* inodes */
+  totalInodes = stat.f_files;
+  freeInodes = stat.f_ffree;
+  usedInodePercentage = (1 - ((double)freeInodes / (double)totalInodes)) * 100;
 
-        usedFileSystemPercentage = (1 - ((double)freeFileSystemSize
-                                         / (double)totalFileSystemSize)) * 100;
-        totalFileSystemSizeHR =
-                (double)totalFileSystemSize / (double)(1<<30);
-        fileSystemUnitStr = "GiB";
-        if (totalFileSystemSizeHR > 1024) {
-                totalFileSystemSizeHR = (double)totalFileSystemSize / (double)((long long)1<<40);
-                fileSystemUnitStr = "TiB";
-        }
+  fileSystemUnitStr = "GiB";
+  if (totalFileSystemSizeHR > 1024) {
+          totalFileSystemSizeHR = (double)totalFileSystemSize / (double)((long long)1<<40);
+          fileSystemUnitStr = "TiB";
+  }
+  if(outputFormat == OUTPUT_DEFAULT){
+    fprintf(out_resultfile, "%-20s: %s\n", "Path", filename);
+    fprintf(out_resultfile, "%-20s: %.1f %s   Used FS: %2.1f%%   ",
+            "FS", totalFileSystemSizeHR, fileSystemUnitStr,
+            usedFileSystemPercentage);
+    fprintf(out_resultfile, "Inodes: %.1f Mi   Used Inodes: %2.1f%%\n",
+            (double)totalInodes / (double)(1<<20),
+            usedInodePercentage);
+    fflush(out_logfile);
+  }else if(outputFormat == OUTPUT_JSON){
+    fprintf(out_resultfile, "    , \"Path\": \"%s\",", filename);
+    fprintf(out_resultfile, "\"Capacity\": \"%.1f %s\", \"Used Capacity\": \"%2.1f%%\",",
+            totalFileSystemSizeHR, fileSystemUnitStr,
+            usedFileSystemPercentage);
+    fprintf(out_resultfile, "\"Inodes\": \"%.1f Mi\", \"Used Inodes\" : \"%2.1f%%\"\n",
+            (double)totalInodes / (double)(1<<20),
+            usedInodePercentage);
+  }else if(outputFormat == OUTPUT_CSV){
 
-        /* inodes */
-        totalInodes = statusBuffer.f_files;
-        freeInodes = statusBuffer.f_ffree;
-        usedInodePercentage =
-            (1 - ((double)freeInodes / (double)totalInodes)) * 100;
+  }
 
-        /* show results */
-        if (realpath(fileSystem, realPath) == NULL) {
-                ERR("unable to use realpath()");
-        }
-
-        if(outputFormat == OUTPUT_DEFAULT){
-          fprintf(out_resultfile, "%-20s: %s\n", "Path", realPath);
-          fprintf(out_resultfile, "%-20s: %.1f %s   Used FS: %2.1f%%   ",
-                  "FS", totalFileSystemSizeHR, fileSystemUnitStr,
-                  usedFileSystemPercentage);
-          fprintf(out_resultfile, "Inodes: %.1f Mi   Used Inodes: %2.1f%%\n",
-                  (double)totalInodes / (double)(1<<20),
-                  usedInodePercentage);
-          fflush(out_logfile);
-        }else if(outputFormat == OUTPUT_JSON){
-          fprintf(out_resultfile, "    , \"Path\": \"%s\",", realPath);
-          fprintf(out_resultfile, "\"Capacity\": \"%.1f %s\", \"Used Capacity\": \"%2.1f%%\",",
-                  totalFileSystemSizeHR, fileSystemUnitStr,
-                  usedFileSystemPercentage);
-          fprintf(out_resultfile, "\"Inodes\": \"%.1f Mi\", \"Used Inodes\" : \"%2.1f%%\"\n",
-                  (double)totalInodes / (double)(1<<20),
-                  usedInodePercentage);
-        }else if(outputFormat == OUTPUT_CSV){
-
-        }
-
-#endif /* !_WIN32 */
-
-        return;
+  return;
 }
 
 /*
@@ -455,27 +728,6 @@ int Regex(char *string, char *pattern)
 #endif
 
         return (retValue);
-}
-
-/*
- * Seed random generator.
- */
-void SeedRandGen(MPI_Comm testComm)
-{
-        unsigned int randomSeed;
-
-        if (rank == 0) {
-#ifdef _WIN32
-                rand_s(&randomSeed);
-#else
-                struct timeval randGenTimer;
-                gettimeofday(&randGenTimer, (struct timezone *)NULL);
-                randomSeed = randGenTimer.tv_usec;
-#endif
-        }
-        MPI_CHECK(MPI_Bcast(&randomSeed, 1, MPI_INT, 0,
-                            testComm), "cannot broadcast random seed value");
-        srandom(randomSeed);
 }
 
 /*
@@ -500,10 +752,6 @@ int uname(struct utsname *name)
 }
 #endif /* _WIN32 */
 
-
-double wall_clock_deviation;
-double wall_clock_delta = 0;
-
 /*
  * Get time stamp.  Use MPI_Timer() unless _NO_MPI_TIMER is defined,
  * in which case use gettimeofday().
@@ -511,55 +759,46 @@ double wall_clock_delta = 0;
 double GetTimeStamp(void)
 {
         double timeVal;
-#ifdef _NO_MPI_TIMER
         struct timeval timer;
 
         if (gettimeofday(&timer, (struct timezone *)NULL) != 0)
                 ERR("cannot use gettimeofday()");
         timeVal = (double)timer.tv_sec + ((double)timer.tv_usec / 1000000);
-#else                           /* not _NO_MPI_TIMER */
-        timeVal = MPI_Wtime();  /* no MPI_CHECK(), just check return value */
-        if (timeVal < 0)
-                ERR("cannot use MPI_Wtime()");
-#endif                          /* _NO_MPI_TIMER */
-
-        /* wall_clock_delta is difference from root node's time */
-        timeVal -= wall_clock_delta;
 
         return (timeVal);
 }
 
 /*
  * Determine any spread (range) between node times.
+ * Obsolete
  */
-static double TimeDeviation(void)
+static double TimeDeviation(MPI_Comm com)
 {
         double timestamp;
         double min = 0;
         double max = 0;
         double roottimestamp;
 
-        MPI_CHECK(MPI_Barrier(mpi_comm_world), "barrier error");
+        MPI_CHECK(MPI_Barrier(com), "barrier error");
         timestamp = GetTimeStamp();
         MPI_CHECK(MPI_Reduce(&timestamp, &min, 1, MPI_DOUBLE,
-                             MPI_MIN, 0, mpi_comm_world),
+                             MPI_MIN, 0, com),
                   "cannot reduce tasks' times");
         MPI_CHECK(MPI_Reduce(&timestamp, &max, 1, MPI_DOUBLE,
-                             MPI_MAX, 0, mpi_comm_world),
+                             MPI_MAX, 0, com),
                   "cannot reduce tasks' times");
 
         /* delta between individual nodes' time and root node's time */
         roottimestamp = timestamp;
-        MPI_CHECK(MPI_Bcast(&roottimestamp, 1, MPI_DOUBLE, 0, mpi_comm_world),
+        MPI_CHECK(MPI_Bcast(&roottimestamp, 1, MPI_DOUBLE, 0, com),
                   "cannot broadcast root's time");
-        wall_clock_delta = timestamp - roottimestamp;
+        // wall_clock_delta = timestamp - roottimestamp;
 
         return max - min;
 }
 
-void init_clock(){
-  /* check for skew between tasks' start times */
-  wall_clock_deviation = TimeDeviation();
+void init_clock(MPI_Comm com){
+
 }
 
 char * PrintTimestamp() {
@@ -577,16 +816,16 @@ char * PrintTimestamp() {
     return datestring;
 }
 
-int64_t ReadStoneWallingIterations(char * const filename){
+int64_t ReadStoneWallingIterations(char * const filename, MPI_Comm com){
   long long data;
   if(rank != 0){
-    MPI_Bcast( & data, 1, MPI_LONG_LONG_INT, 0, mpi_comm_world);
+    MPI_Bcast( & data, 1, MPI_LONG_LONG_INT, 0, com);
     return data;
   }else{
     FILE * out = fopen(filename, "r");
     if (out == NULL){
       data = -1;
-      MPI_Bcast( & data, 1, MPI_LONG_LONG_INT, 0, mpi_comm_world);
+      MPI_Bcast( & data, 1, MPI_LONG_LONG_INT, 0, com);
       return data;
     }
     int ret = fscanf(out, "%lld", & data);
@@ -594,7 +833,7 @@ int64_t ReadStoneWallingIterations(char * const filename){
       return -1;
     }
     fclose(out);
-    MPI_Bcast( & data, 1, MPI_LONG_LONG_INT, 0, mpi_comm_world);
+    MPI_Bcast( & data, 1, MPI_LONG_LONG_INT, 0, com);
     return data;
   }
 }
@@ -676,4 +915,100 @@ char *HumanReadable(IOR_offset_t value, int base)
                 snprintf(valueStr, MAX_STR-1, "-");
         }
         return valueStr;
+}
+
+#if defined(HAVE_GETCPU_SYSCALL)
+// Assume we aren't worried about thread/process migration.
+// Test on Intel systems and see if we can get rid of the architecture specificity
+// of the code.
+unsigned long GetProcessorAndCore(int *chip, int *core){
+	return syscall(SYS_getcpu, core, chip, NULL);
+}
+#elif defined(HAVE_RDTSCP_ASM)
+// We're on an intel processor and use the
+// rdtscp instruction.
+unsigned long GetProcessorAndCore(int *chip, int *core){
+	unsigned long a,d,c;
+	__asm__ volatile("rdtscp" : "=a" (a), "=d" (d), "=c" (c));
+	*chip = (c & 0xFFF000)>>12;
+	*core = c & 0xFFF;
+	return ((unsigned long)a) | (((unsigned long)d) << 32);;
+}
+#else
+// TODO: Add in AMD function
+unsigned long GetProcessorAndCore(int *chip, int *core){
+#warning GetProcessorAndCore is implemented as a dummy
+  *chip = 0;
+  *core = 0;
+	return 1;
+}
+#endif
+
+
+
+/*
+ * Allocate a page-aligned (required by O_DIRECT) buffer.
+ */
+void *aligned_buffer_alloc(size_t size, ior_memory_flags type)
+{
+  size_t pageMask;
+  char *buf, *tmp;
+  char *aligned;
+
+  if(type == IOR_MEMORY_TYPE_GPU_MANAGED){
+#ifdef HAVE_CUDA
+    // use unified memory here to allow drop-in-replacement
+    if (cudaMallocManaged((void**) & buf, size, cudaMemAttachGlobal) != cudaSuccess){
+      ERR("Cannot allocate buffer on GPU");
+    }
+    return buf;
+#else
+    ERR("No CUDA supported, cannot allocate on the GPU");
+#endif
+  }else if(type == IOR_MEMORY_TYPE_GPU_DEVICE_ONLY){
+#ifdef HAVE_GPU_DIRECT
+      if (cudaMalloc((void**) & buf, size) != cudaSuccess){
+        ERR("Cannot allocate buffer on GPU");
+      }
+      return buf;
+#else
+      ERR("No GPUDirect supported, cannot allocate on the GPU");
+#endif
+    }
+
+#ifdef HAVE_SYSCONF
+  long pageSize = sysconf(_SC_PAGESIZE);
+#else
+  size_t pageSize = getpagesize();
+#endif
+
+  pageMask = pageSize - 1;
+  buf = safeMalloc(size + pageSize + sizeof(void *));
+  /* find the alinged buffer */
+  tmp = buf + sizeof(char *);
+  aligned = tmp + pageSize - ((size_t) tmp & pageMask);
+  /* write a pointer to the original malloc()ed buffer into the bytes
+     preceding "aligned", so that the aligned buffer can later be free()ed */
+  tmp = aligned - sizeof(void *);
+  *(void **)tmp = buf;
+
+  return (void *)aligned;
+}
+
+/*
+ * Free a buffer allocated by aligned_buffer_alloc().
+ */
+void aligned_buffer_free(void *buf, ior_memory_flags gpu)
+{
+  if(gpu){
+#ifdef HAVE_CUDA
+    if (cudaFree(buf) != cudaSuccess){
+      WARN("Cannot free buffer on GPU");
+    }
+    return;
+#else
+    ERR("No CUDA supported, cannot free on the GPU");
+#endif
+  }
+  free(*(void **)((char *)buf - sizeof(char *)));
 }

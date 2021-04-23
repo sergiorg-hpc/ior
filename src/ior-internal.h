@@ -17,13 +17,15 @@ void PrintShortSummary(IOR_test_t * test);
 void PrintLongSummaryAllTests(IOR_test_t *tests_head);
 void PrintLongSummaryHeader();
 void PrintLongSummaryOneTest(IOR_test_t *test);
-void DisplayFreespace(IOR_param_t * test);
 void GetTestFileName(char *, IOR_param_t *);
 void PrintRemoveTiming(double start, double finish, int rep);
-void PrintReducedResult(IOR_test_t *test, int access, double bw, double *diff_subset, double totalTime, int rep);
+void PrintReducedResult(IOR_test_t *test, int access, double bw, double iops, double latency,
+			double *diff_subset, double totalTime, int rep);
 void PrintTestEnds();
 void PrintTableHeader();
 /* End of ior-output */
+
+IOR_offset_t *GetOffsetArrayRandom(IOR_param_t * test, int pretendRank, IOR_offset_t * out_count);
 
 struct results {
   double min;
